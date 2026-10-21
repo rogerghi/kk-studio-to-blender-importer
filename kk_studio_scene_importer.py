@@ -330,7 +330,15 @@ class KKMeshLoader:
                         mesh_ptr = getattr(c, "m_Mesh", None)
                         if mesh_ptr:
                             m = mesh_ptr.read()
-                            b_mesh = self._create_blender_mesh(m)
+                            is_skinned = (cname == "SkinnedMeshRenderer")
+                            if is_skinned:
+                                b_mesh = self._create_blender_mesh(m)
+                                l_mat = curr_mat
+                            else:
+                                b_key = f"{prefab_name}_{getattr(go, 'm_Name', '')}_{m.m_Name}"
+                                b_mesh = self._create_blender_mesh(m, mesh_key=b_key, transform_mat=curr_mat)
+                                l_mat = Matrix.Identity(4)
+
                             if b_mesh is None:
                                 continue
                             b_mat = self._create_blender_material(prefab_name, tex_map, colors)
@@ -338,7 +346,7 @@ class KKMeshLoader:
                                 "name": getattr(go, "m_Name", m.m_Name),
                                 "mesh": b_mesh,
                                 "material": b_mat,
-                                "local_matrix": curr_mat
+                                "local_matrix": l_mat
                             }
                             if cname == "SkinnedMeshRenderer" and getattr(c, "m_Bones", None):
                                 ubones = [b.read() for b in c.m_Bones]
@@ -413,16 +421,16 @@ class KKMeshLoader:
 
         return extracted_parts
 
-    def _create_blender_mesh(self, unity_mesh):
-        mesh_name = unity_mesh.m_Name
-        if mesh_name in self.mesh_cache:
-            return self.mesh_cache[mesh_name]
+    def _create_blender_mesh(self, unity_mesh, mesh_key=None, transform_mat=None):
+        name_key = mesh_key if mesh_key else unity_mesh.m_Name
+        if name_key in self.mesh_cache:
+            return self.mesh_cache[name_key]
 
         try:
             obj_str = unity_mesh.export()
         except Exception:
             if self.use_fallback_cubes:
-                return self.create_fallback_cube(mesh_name)
+                return self.create_fallback_cube(name_key)
             return None
 
         verts, uvs, faces = [], [], []
@@ -437,8 +445,10 @@ class KKMeshLoader:
                 face = [int(p.split("/")[0]) - 1 for p in line.split()[1:]]
                 faces.append(face)
 
-        mesh_data = bpy.data.meshes.new(mesh_name)
+        mesh_data = bpy.data.meshes.new(name_key)
         mesh_data.from_pydata(verts, [], faces)
+        if transform_mat and transform_mat != Matrix.Identity(4):
+            mesh_data.transform(transform_mat)
         mesh_data.update()
 
         if uvs and len(mesh_data.polygons) > 0:
@@ -450,7 +460,7 @@ class KKMeshLoader:
                         uv_layer.data[loop_idx].uv = uvs[v_idx]
                     loop_idx += 1
 
-        self.mesh_cache[mesh_name] = mesh_data
+        self.mesh_cache[name_key] = mesh_data
         return mesh_data
 
     def _create_blender_material(self, item_name: str, tex_map: dict, colors: list):
