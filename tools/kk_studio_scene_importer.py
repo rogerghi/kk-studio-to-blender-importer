@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 4, 1),
+    "version": (1, 4, 2),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
     "description": "Imports Koikatsu Studio scene cards into Blender without characters, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
@@ -230,8 +230,9 @@ class KKItemResolver:
 # =========================================================================
 
 class KKMeshLoader:
-    def __init__(self, kk_dir: str):
+    def __init__(self, kk_dir: str, use_fallback_cubes: bool = False):
         self.kk_dir = kk_dir
+        self.use_fallback_cubes = use_fallback_cubes
         self.bundle_cache = {} # cache_key -> {"gos": {name_lower: [go, ...]}, "textures": {name_lower: tex}, "meshes": {name_lower: mesh}}
         self.mesh_cache = {}   # cache_key -> bpy.types.Mesh
         self.mat_cache = {}    # mat_key -> bpy.types.Material
@@ -330,6 +331,8 @@ class KKMeshLoader:
                         if mesh_ptr:
                             m = mesh_ptr.read()
                             b_mesh = self._create_blender_mesh(m)
+                            if b_mesh is None:
+                                continue
                             b_mat = self._create_blender_material(prefab_name, tex_map, colors)
                             part = {
                                 "name": getattr(go, "m_Name", m.m_Name),
@@ -398,14 +401,15 @@ class KKMeshLoader:
             for m_name, m in bundle_index["meshes"].items():
                 if prefab_name.lower() in m_name or m_name in prefab_name.lower():
                     b_mesh = self._create_blender_mesh(m)
-                    b_mat = self._create_blender_material(prefab_name, tex_map, colors)
-                    extracted_parts.append({
-                        "name": m.m_Name,
-                        "mesh": b_mesh,
-                        "material": b_mat,
-                        "local_matrix": Matrix.Identity(4)
-                    })
-                    break
+                    if b_mesh is not None:
+                        b_mat = self._create_blender_material(prefab_name, tex_map, colors)
+                        extracted_parts.append({
+                            "name": m.m_Name,
+                            "mesh": b_mesh,
+                            "material": b_mat,
+                            "local_matrix": Matrix.Identity(4)
+                        })
+                        break
 
         return extracted_parts
 
@@ -417,7 +421,9 @@ class KKMeshLoader:
         try:
             obj_str = unity_mesh.export()
         except Exception:
-            return self.create_fallback_cube(mesh_name)
+            if self.use_fallback_cubes:
+                return self.create_fallback_cube(mesh_name)
+            return None
 
         verts, uvs, faces = [], [], []
         for line in obj_str.splitlines():
@@ -853,8 +859,14 @@ class KK_OT_ImportScene(bpy.types.Operator):
             resolver = KKItemResolver.get_resolver(kk_dir)
             resolver.index_all()
 
-            mesh_loader = KKMeshLoader(kk_dir)
+            mesh_loader = KKMeshLoader(kk_dir, use_fallback_cubes=props.use_fallback_cubes)
             parser = KKStudioParser(scene_path)
+
+            children_map = {}
+            for k, n in parser.parsed_tree.items():
+                pk = n.get("parent_key")
+                if pk is not None:
+                    children_map.setdefault(pk, []).append(k)
 
             if not props.import_attached_props:
                 char_keys = {k for k, v in parser.parsed_tree.items() if v.get("kind") == 0}
@@ -1030,10 +1042,16 @@ class KK_OT_ImportScene(bpy.types.Operator):
                 if item_def:
                     parts = mesh_loader.get_meshes_and_materials(item_def, node.get("colors"))
 
-                is_dummy_node = "obj無し" in display_name or "objなし" in display_name or "（obj無し）" in display_name or "回転音" in display_name
-                if not parts and props.use_fallback_cubes and not is_dummy_node:
-                    fallback_mesh = mesh_loader.create_fallback_cube(display_name)
-                    parts = [{"name": display_name, "mesh": fallback_mesh, "material": None}]
+                is_dummy_node = "obj無し" in display_name or "objなし" in display_name or "（obj無し）" in display_name or "回転音" in display_name or "Without Object" in display_name
+                has_children = dic_key in children_map and len(children_map[dic_key]) > 0
+
+                if not parts:
+                    if props.use_fallback_cubes and props.import_meshless and not is_dummy_node:
+                        fallback_mesh = mesh_loader.create_fallback_cube(display_name)
+                        parts = [{"name": display_name, "mesh": fallback_mesh, "material": None}]
+                    elif not props.import_meshless and not has_children:
+                        # Skip leaf meshless objects that have no 3D geometry
+                        continue
 
                 target_col = get_target_collection(dic_key)
                 is_vis = node.get("visible", True)
@@ -1256,6 +1274,11 @@ class KKStudioSceneProperties(bpy.types.PropertyGroup):
         description="Load props attached to characters (body/clothes ignored)",
         default=False
     )
+    import_meshless: BoolProperty(
+        name="Import Meshless Objects",
+        description="Load objects without 3D geometry (keeps hierarchy empties for children if disabled, skips leaf meshless objects)",
+        default=False
+    )
     use_fallback_cubes: BoolProperty(
         name="Fallback Cubes",
         description="Place labeled cubes for missing modded assets",
@@ -1289,6 +1312,7 @@ class KK_PT_StudioImporterPanel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Settings:", icon='PREFERENCES')
         box.prop(props, "import_attached_props")
+        box.prop(props, "import_meshless")
         box.prop(props, "use_fallback_cubes")
 
         layout.separator()
