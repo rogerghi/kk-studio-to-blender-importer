@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 4, 1),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
-    "description": "Imports Koikatsu Studio scene cards into Blender without characters, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
+    "description": "Imports Koikatsu Studio scene cards into Blender with character pose armatures, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
     "category": "Import-Export",
 }
 
@@ -526,6 +526,25 @@ class KKMeshLoader:
         return mesh_data
 
 
+def load_base_skeleton_data():
+    addon_dir = os.path.dirname(os.path.abspath(__file__))
+    sk_path = os.path.join(addon_dir, "kk_base_skeleton.json")
+    maps_path = os.path.join(addon_dir, "kk_studio_bone_maps.json")
+    if not os.path.exists(sk_path) or not os.path.exists(maps_path):
+        return None, None, None
+    try:
+        with open(sk_path, "r", encoding="utf-8") as f:
+            sk = json.load(f)
+        with open(maps_path, "r", encoding="utf-8") as f:
+            mp = json.load(f)
+        acc_m = {int(k): v for k, v in mp.get("accessory_points", {}).items()}
+        bone_m = {int(k): v for k, v in mp.get("bones", {}).items()}
+        return sk, acc_m, bone_m
+    except Exception:
+        return None, None, None
+
+
+# =========================================================================
 # 4. Binary Tree & ExtendedSave Parser
 # =========================================================================
 
@@ -937,6 +956,54 @@ class KK_OT_ImportScene(bpy.types.Operator):
 
             eval_order = get_eval_order(parser.parsed_tree)
 
+            # Compute Forward Kinematics for Characters if skeleton data is available
+            skeleton, acc_map, bone_map = load_base_skeleton_data()
+            name_to_bone_idx = {v: k for k, v in bone_map.items()} if bone_map else {}
+            char_fk = {}
+
+            if skeleton:
+                for dic_key, node in parser.parsed_tree.items():
+                    if node.get("kind") == 0:
+                        c_pos = Vector(node.get("pos", (0, 0, 0)))
+                        c_rot = node.get("rot", (0, 0, 0))
+                        c_q = Euler((math.radians(c_rot[0]), math.radians(c_rot[1]), math.radians(c_rot[2])), 'ZXY').to_quaternion()
+                        c_scale = Vector(node.get("scale", (1, 1, 1)))
+                        char_bones = node.get("bones", {})
+
+                        bone_world = {}
+                        def get_bw(b_name):
+                            if b_name in bone_world:
+                                return bone_world[b_name]
+                            info = skeleton[b_name]
+                            p_name = info['p']
+                            t = Vector(info['t'])
+                            q = Quaternion((info['r'][3], info['r'][0], info['r'][1], info['r'][2]))
+                            s = Vector(info['s'])
+
+                            b_idx = name_to_bone_idx.get(b_name)
+                            if b_idx is not None and b_idx in char_bones:
+                                fk_rot = char_bones[b_idx]["rot"]
+                                fk_q = Euler((math.radians(fk_rot[0]), math.radians(fk_rot[1]), math.radians(fk_rot[2])), 'ZXY').to_quaternion()
+                                q = q @ fk_q
+
+                            if p_name and p_name in skeleton:
+                                p_pos, p_q, p_scale = get_bw(p_name)
+                                scaled_offset = Vector((t.x * p_scale.x, t.y * p_scale.y, t.z * p_scale.z))
+                                w_pos = p_pos + (p_q @ scaled_offset)
+                                w_q = p_q @ q
+                                w_scale = Vector((p_scale.x * s.x, p_scale.y * s.y, p_scale.z * s.z))
+                            else:
+                                scaled_offset = Vector((t.x * c_scale.x, t.y * c_scale.y, t.z * c_scale.z))
+                                w_pos = c_pos + (c_q @ scaled_offset)
+                                w_q = c_q @ q
+                                w_scale = Vector((c_scale.x * s.x, c_scale.y * s.y, c_scale.z * s.z))
+                            bone_world[b_name] = (w_pos, w_q, w_scale)
+                            return bone_world[b_name]
+
+                        for b_name in skeleton:
+                            get_bw(b_name)
+                        char_fk[dic_key] = bone_world
+
             # Compute absolute Unity world transforms (canceling scale inheritance to match KK Studio LateUpdate)
             unity_world = {}
             for k in eval_order:
@@ -953,6 +1020,23 @@ class KK_OT_ImportScene(bpy.types.Operator):
                 local_scale = Vector((scale[0], scale[1], scale[2]))
 
                 pk = node.get("parent_key")
+                if pk is not None and pk in parser.parsed_tree and parser.parsed_tree[pk].get("kind") == 0:
+                    ap_idx = node.get("attach_point")
+                    ap_name = acc_map.get(ap_idx) if acc_map else None
+                    if ap_name and pk in char_fk and ap_name in char_fk[pk]:
+                        ap_pos, ap_q, ap_scale = char_fk[pk][ap_name]
+                        i_pos_u = Vector(pos)
+                        scaled_offset_u = Vector((i_pos_u.x * ap_scale.x, i_pos_u.y * ap_scale.y, i_pos_u.z * ap_scale.z))
+                        w_pos_u = ap_pos + (ap_q @ scaled_offset_u)
+                        i_rot_u = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_quaternion()
+                        w_q_u = ap_q @ i_rot_u
+
+                        bl_w_pos = Vector((-w_pos_u.x, w_pos_u.y, w_pos_u.z))
+                        bl_e = w_q_u.to_euler('ZXY')
+                        bl_w_q = Euler((bl_e.x, -bl_e.y, -bl_e.z), 'ZXY').to_quaternion()
+                        unity_world[k] = (bl_w_pos, bl_w_q, local_scale)
+                        continue
+
                 if pk is not None and pk in unity_world:
                     p_pos, p_q, p_scale = unity_world[pk]
                     scaled_offset = Vector((local_pos.x * p_scale.x, local_pos.y * p_scale.y, local_pos.z * p_scale.z))
@@ -975,20 +1059,76 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     display_name = parser.tree_names.get(dic_key, node.get("name", f"Node_{dic_key}"))
                     target_col = folder_cols.get(dic_key) if kind == 3 else get_target_collection(dic_key)
 
-                    empty = bpy.data.objects.new(display_name, None)
-                    if kind == 3:
-                        empty.empty_display_type = 'PLAIN_AXES'
-                        empty.empty_display_size = 0.03 # subtle, clean anchor
+                    if kind == 0 and skeleton:
+                        arm_data = bpy.data.armatures.new(f"{display_name}_Armature")
+                        arm_obj = bpy.data.objects.new(display_name, arm_data)
+                        target_col.objects.link(arm_obj)
+                        context.view_layer.objects.active = arm_obj
+                        bpy.ops.object.mode_set(mode='EDIT')
+
+                        rest_unity = {}
+                        def get_unity_rest(b_name):
+                            if b_name in rest_unity: return rest_unity[b_name]
+                            info = skeleton[b_name]
+                            p_name = info['p']
+                            t = Vector(info['t'])
+                            r = Quaternion((info['r'][3], info['r'][0], info['r'][1], info['r'][2]))
+                            m_local = Matrix.Translation(t) @ r.to_matrix().to_4x4()
+                            if p_name and p_name in skeleton:
+                                m_world = get_unity_rest(p_name) @ m_local
+                            else:
+                                m_world = m_local
+                            rest_unity[b_name] = m_world
+                            return m_world
+
+                        for b_name in skeleton: get_unity_rest(b_name)
+
+                        created_eb = {}
+                        for b_name in skeleton:
+                            eb = arm_data.edit_bones.new(b_name)
+                            m_u = rest_unity[b_name]
+                            head_pos = Vector((-m_u[0][3], m_u[1][3], m_u[2][3]))
+                            eb.head = head_pos
+                            eb.tail = head_pos + Vector((0, 0, 0.02))
+                            created_eb[b_name] = eb
+
+                        for b_name, info in skeleton.items():
+                            p_name = info['p']
+                            if p_name and p_name in created_eb:
+                                created_eb[b_name].parent = created_eb[p_name]
+
+                        bpy.ops.object.mode_set(mode='POSE')
+                        pose_bones = arm_obj.pose.bones
+                        for b_idx, b_info in node.get("bones", {}).items():
+                            b_name = bone_map.get(b_idx) if bone_map else None
+                            if b_name and b_name in pose_bones:
+                                pb = pose_bones[b_name]
+                                b_rot = b_info["rot"]
+                                pb.rotation_mode = 'ZXY'
+                                pb.rotation_euler = Euler((
+                                    math.radians(b_rot[0]),
+                                    math.radians(-b_rot[1]),
+                                    math.radians(-b_rot[2])
+                                ), 'ZXY')
+
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                        created_objects[dic_key] = arm_obj
                     else:
-                        empty.empty_display_type = 'PLAIN_AXES'
-                        empty.empty_display_size = 0.1
-                    target_col.objects.link(empty)
-                    created_objects[dic_key] = empty
+                        empty = bpy.data.objects.new(display_name, None)
+                        if kind == 3:
+                            empty.empty_display_type = 'PLAIN_AXES'
+                            empty.empty_display_size = 0.03 # subtle, clean anchor
+                        else:
+                            empty.empty_display_type = 'PLAIN_AXES'
+                            empty.empty_display_size = 0.1
+                        target_col.objects.link(empty)
+                        created_objects[dic_key] = empty
 
                     is_vis = node.get("visible", True)
                     if not is_vis:
-                        empty.hide_viewport = True
-                        empty.hide_render = True
+                        created_objects[dic_key].hide_viewport = True
+                        created_objects[dic_key].hide_render = True
+
             # 3. Second Pass: Create Props & Multi-Part Meshes
             item_keys = [k for k, n in parser.parsed_tree.items() if n["kind"] == 1]
             total_items = len(item_keys)
