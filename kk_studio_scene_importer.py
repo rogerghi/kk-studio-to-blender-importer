@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
     "description": "Imports Koikatsu Studio scene cards into Blender with character pose armatures, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
@@ -14,10 +14,6 @@ sys.path.append(site.getusersitepackages())
 import bpy
 import struct
 import io
-import re
-import glob
-import json
-import zipfile
 import math
 import time
 from mathutils import Matrix, Vector, Quaternion, Euler
@@ -30,6 +26,47 @@ try:
     DEPS_LOADED = True
 except ImportError:
     DEPS_LOADED = False
+
+# =========================================================================
+# Modular Imports
+# =========================================================================
+
+try:
+    from .parser import KKStudioParser
+    from .resolver import KKItemResolver
+    from .mesh_loader import KKMeshLoader
+    from .retarget import (
+        KK_TO_COM_BONES,
+        KK_PRIMARY_BONE_CHAIN,
+        load_base_skeleton_data,
+        build_char_skeleton,
+        find_com_append_blend,
+        append_com_body,
+        setup_kk_to_com_transfer,
+        KK_OT_TransferToCOM,
+    )
+    from .com_tools import (
+        KK_OT_CleanOccludedGeometry,
+        KK_OT_MergeSelectedProps,
+    )
+except ImportError:
+    from parser import KKStudioParser
+    from resolver import KKItemResolver
+    from mesh_loader import KKMeshLoader
+    from retarget import (
+        KK_TO_COM_BONES,
+        KK_PRIMARY_BONE_CHAIN,
+        load_base_skeleton_data,
+        build_char_skeleton,
+        find_com_append_blend,
+        append_com_body,
+        setup_kk_to_com_transfer,
+        KK_OT_TransferToCOM,
+    )
+    from com_tools import (
+        KK_OT_CleanOccludedGeometry,
+        KK_OT_MergeSelectedProps,
+    )
 
 
 # =========================================================================
@@ -50,782 +87,8 @@ def unity_trs_matrix(pos: tuple, rot_deg: tuple, scale: tuple) -> Matrix:
     return T @ R @ S
 
 
-
 # =========================================================================
-# 2. Vanilla & Zipmod Item Database Resolver (with Disk Caching)
-# =========================================================================
-
-class KKItemResolver:
-    _instance = None
-
-    def __init__(self, kk_dir: str):
-        self.kk_dir = kk_dir
-        self.item_index = {}       # "group_category_no" -> dict(bundle, prefab, name)
-        self.name_index = {}       # prefab_name.lower() -> dict(bundle, prefab, name)
-        self.zipmod_index = {}     # guid -> zipmod_path
-        self.zipmod_items = {}     # (guid, slot) -> dict(bundle, prefab, name)
-        self.is_indexed = False
-        addon_dir = os.path.dirname(os.path.abspath(__file__))
-        self.cache_dir = os.path.join(addon_dir, "cache")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.cache_path = os.path.join(self.cache_dir, "kk_item_index_cache.json")
-
-    @classmethod
-    def get_resolver(cls, kk_dir: str):
-        if cls._instance is None or cls._instance.kk_dir != kk_dir:
-            cls._instance = KKItemResolver(kk_dir)
-        return cls._instance
-
-    def load_cache(self) -> bool:
-        if not os.path.exists(self.cache_path):
-            return False
-        try:
-            with open(self.cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.item_index = data.get("item_index", {})
-            self.name_index = data.get("name_index", {})
-            self.zipmod_index = data.get("zipmod_index", {})
-            raw_zm = data.get("zipmod_items", {})
-            self.zipmod_items = {}
-            for k, v in raw_zm.items():
-                if ":" in k:
-                    guid, slot_str = k.split(":", 1)
-                    try:
-                        self.zipmod_items[(guid, int(slot_str))] = v
-                    except ValueError:
-                        pass
-            self.is_indexed = True
-            print(f"[KK Studio] Loaded item database from cache: {len(self.item_index)} vanilla items, {len(self.zipmod_items)} mod items.")
-            return True
-        except Exception as e:
-            print(f"[KK Studio] Failed to read cache: {e}")
-            return False
-
-    def save_cache(self):
-        try:
-            serialized_zm = {f"{k[0]}:{k[1]}": v for k, v in self.zipmod_items.items()}
-            data = {
-                "item_index": self.item_index,
-                "name_index": self.name_index,
-                "zipmod_index": self.zipmod_index,
-                "zipmod_items": serialized_zm
-            }
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            print(f"[KK Studio] Saved item database cache to {self.cache_path}")
-        except Exception as e:
-            print(f"[KK Studio] Failed to save cache: {e}")
-
-    def index_all(self, force: bool = False):
-        if self.is_indexed and not force:
-            return
-        if not force and self.load_cache():
-            return
-        print("[KK Studio] Scanning Koikatsu asset bundles and mods from disk...")
-        self._index_vanilla()
-        self._index_zipmods()
-        self.is_indexed = True
-        self.save_cache()
-
-    def _index_vanilla(self):
-        studio_info_dir = os.path.join(self.kk_dir, "abdata", "studio", "info")
-        if not os.path.isdir(studio_info_dir):
-            return
-        bundles = glob.glob(os.path.join(studio_info_dir, "*.unity3d"))
-        for bpath in bundles:
-            try:
-                env = UnityPy.load(bpath)
-                for obj in env.objects:
-                    if obj.type.name == "MonoBehaviour":
-                        mb = obj.read()
-                        name = getattr(mb, "m_Name", "")
-                        if name.startswith("ItemList_") and hasattr(mb, "list") and mb.list:
-                            for row_obj in mb.list:
-                                if hasattr(row_obj, "list") and len(row_obj.list) >= 7:
-                                    row = row_obj.list
-                                    try:
-                                        no = int(row[0])
-                                        group = int(row[1])
-                                        cat = int(row[2])
-                                        disp_name = row[3]
-                                        bundle_path = row[5]
-                                        prefab_name = row[6]
-                                        info = {
-                                            "no": no, "group": group, "category": cat,
-                                            "name": disp_name, "bundle": bundle_path,
-                                            "prefab": prefab_name, "source": "vanilla"
-                                        }
-                                        self.item_index[f"{group}_{cat}_{no}"] = info
-                                        self.name_index[prefab_name.lower()] = info
-                                    except (ValueError, IndexError):
-                                        continue
-            except Exception:
-                pass
-
-    def _index_zipmods(self):
-        mods_dir = os.path.join(self.kk_dir, "mods")
-        if not os.path.isdir(mods_dir):
-            return
-        zipmods = glob.glob(os.path.join(mods_dir, "**", "*.zipmod"), recursive=True)
-        for zpath in zipmods:
-            try:
-                with zipfile.ZipFile(zpath, "r") as z:
-                    names = z.namelist()
-                    guid = None
-                    if "manifest.xml" in names:
-                        content = z.open("manifest.xml").read().decode("utf-8-sig", errors="ignore")
-                        m = re.search(r"<guid>(.*?)</guid>", content, re.IGNORECASE)
-                        if m:
-                            guid = m.group(1).strip()
-                            self.zipmod_index[guid] = zpath
-
-                    for fn in names:
-                        if "itemlist" in fn.lower() and fn.endswith(".csv"):
-                            lines = z.open(fn).read().decode("utf-8-sig", errors="ignore").splitlines()
-                            for line in lines[1:]:
-                                parts = line.split(",")
-                                if len(parts) >= 7:
-                                    try:
-                                        slot = int(parts[0])
-                                        cat = int(parts[1])
-                                        subcat = int(parts[2])
-                                        disp_name = parts[3]
-                                        bundle_path = parts[5]
-                                        prefab_name = parts[6]
-                                        info = {
-                                            "slot": slot, "category": cat, "subcat": subcat,
-                                            "name": disp_name, "bundle": bundle_path,
-                                            "prefab": prefab_name, "zipmod": zpath,
-                                            "source": "zipmod"
-                                        }
-                                        if guid:
-                                            self.zipmod_items[(guid, slot)] = info
-                                        self.name_index[prefab_name.lower()] = info
-                                    except ValueError:
-                                        continue
-            except Exception:
-                pass
-
-    def resolve(self, group: int, cat: int, no: int, uar_guid: str = None, uar_slot: int = None, node_name: str = None):
-        if uar_guid and uar_slot is not None:
-            hit = self.zipmod_items.get((uar_guid, uar_slot))
-            if hit:
-                return hit
-
-        hit = self.item_index.get(f"{group}_{cat}_{no}")
-        if hit:
-            return hit
-
-        if node_name:
-            clean = node_name.split("/")[-1].lower()
-            hit = self.name_index.get(clean)
-            if hit:
-                return hit
-
-        return None
-
-
-# =========================================================================
-# 3. Mesh & Texture Loader (Multi-Mesh & Tint Baking)
-# =========================================================================
-
-class KKMeshLoader:
-    def __init__(self, kk_dir: str, use_fallback_cubes: bool = False):
-        self.kk_dir = kk_dir
-        self.use_fallback_cubes = use_fallback_cubes
-        self.bundle_cache = {} # cache_key -> {"gos": {name_lower: [go, ...]}, "textures": {name_lower: tex}, "meshes": {name_lower: mesh}}
-        self.mesh_cache = {}   # cache_key -> bpy.types.Mesh
-        self.mat_cache = {}    # mat_key -> bpy.types.Material
-
-        addon_dir = os.path.dirname(os.path.abspath(__file__))
-        self.tex_cache_dir = os.path.join(addon_dir, "cache", "textures")
-        os.makedirs(self.tex_cache_dir, exist_ok=True)
-
-    def _get_bundle_index(self, item_info: dict):
-        bundle_rel = item_info["bundle"]
-        cache_key = f"{item_info.get('source')}:{item_info.get('zipmod', '')}:{bundle_rel}"
-        if cache_key in self.bundle_cache:
-            return self.bundle_cache[cache_key]
-
-        bundle_data = None
-        if item_info.get("source") == "zipmod" and "zipmod" in item_info:
-            try:
-                with zipfile.ZipFile(item_info["zipmod"], "r") as z:
-                    for name in z.namelist():
-                        if name.endswith(bundle_rel.replace("\\", "/")) or bundle_rel.replace("\\", "/") in name:
-                            bundle_data = z.read(name)
-                            break
-            except Exception:
-                pass
-        else:
-            full_path = os.path.join(self.kk_dir, "abdata", bundle_rel)
-            if os.path.exists(full_path):
-                try:
-                    with open(full_path, "rb") as f:
-                        bundle_data = f.read()
-                except Exception:
-                    pass
-
-        if not bundle_data:
-            return None
-
-        try:
-            env = UnityPy.load(bundle_data)
-        except Exception:
-            return None
-
-        gos_map = {}
-        meshes_map = {}
-        tex_map = {}
-
-        for obj in env.objects:
-            if obj.type.name == "GameObject":
-                try:
-                    go = obj.read()
-                    gos_map.setdefault(go.m_Name.lower(), []).append(go)
-                except Exception:
-                    pass
-            elif obj.type.name == "Mesh":
-                try:
-                    m = obj.read()
-                    meshes_map[m.m_Name.lower()] = m
-                except Exception:
-                    pass
-            elif obj.type.name == "Texture2D":
-                try:
-                    t = obj.read()
-                    tex_map[t.m_Name.lower()] = t
-                except Exception:
-                    pass
-
-        index = {
-            "gos": gos_map,
-            "meshes": meshes_map,
-            "textures": tex_map
-        }
-        self.bundle_cache[cache_key] = index
-        return index
-
-    def get_meshes_and_materials(self, item_info: dict, colors: list = None):
-        """
-        Loads meshes and materials for an item.
-        Returns a list of dicts: [{"name": subpart_name, "mesh": b_mesh, "material": b_mat}]
-        Supports multi-mesh prefabs without merging!
-        """
-        prefab_name = item_info["prefab"]
-        bundle_index = self._get_bundle_index(item_info)
-        if not bundle_index:
-            return []
-
-        tex_map = bundle_index["textures"]
-        extracted_parts = []
-
-        def process_go(go, parent_mat=Matrix.Identity(4)):
-            curr_mat = parent_mat
-            for comp in getattr(go, "m_Components", []):
-                try:
-                    c = comp.read()
-                    cname = c.__class__.__name__
-                    if cname in ["MeshFilter", "SkinnedMeshRenderer"]:
-                        mesh_ptr = getattr(c, "m_Mesh", None)
-                        if mesh_ptr:
-                            m = mesh_ptr.read()
-                            is_skinned = (cname == "SkinnedMeshRenderer")
-                            if is_skinned:
-                                b_mesh = self._create_blender_mesh(m)
-                                l_mat = curr_mat
-                            else:
-                                b_key = f"{prefab_name}_{getattr(go, 'm_Name', '')}_{m.m_Name}"
-                                b_mesh = self._create_blender_mesh(m, mesh_key=b_key, transform_mat=curr_mat)
-                                l_mat = Matrix.Identity(4)
-
-                            if b_mesh is None:
-                                continue
-                            b_mat = self._create_blender_material(prefab_name, tex_map, colors)
-                            part = {
-                                "name": getattr(go, "m_Name", m.m_Name),
-                                "mesh": b_mesh,
-                                "material": b_mat,
-                                "local_matrix": l_mat
-                            }
-                            if cname == "SkinnedMeshRenderer" and getattr(c, "m_Bones", None):
-                                ubones = [b.read() for b in c.m_Bones]
-                                bnames = [b.m_GameObject.read().m_Name for b in ubones]
-                                pmap = {}
-                                for b in ubones:
-                                    bn = b.m_GameObject.read().m_Name
-                                    pb = b.m_Father.read() if getattr(b, 'm_Father', None) else None
-                                    pmap[bn] = pb.m_GameObject.read().m_Name if pb else None
-                                bposes = []
-                                for bp in getattr(m, "m_BindPose", []):
-                                    bposes.append((
-                                        (bp.e00, bp.e01, bp.e02, bp.e03),
-                                        (bp.e10, bp.e11, bp.e12, bp.e13),
-                                        (bp.e20, bp.e21, bp.e22, bp.e23),
-                                        (bp.e30, bp.e31, bp.e32, bp.e33)
-                                    ))
-                                part["armature_data"] = {
-                                    "bone_names": bnames,
-                                    "parent_map": pmap,
-                                    "bind_poses": bposes,
-                                    "skin": getattr(m, "m_Skin", [])
-                                }
-                            extracted_parts.append(part)
-                except Exception:
-                    pass
-            # Recursively traverse all children preserving local TRS!
-            try:
-                trans = go.m_Transform.read()
-                for c_ptr in getattr(trans, "m_Children", []):
-                    c_trans = c_ptr.read()
-                    c_go = c_trans.m_GameObject.read()
-                    pos = c_trans.m_LocalPosition
-                    rot = c_trans.m_LocalRotation
-                    scale = c_trans.m_LocalScale
-                    
-                    T = Matrix.Translation(Vector((-pos.x, pos.y, pos.z)))
-                    q = Quaternion((rot.w, rot.x, -rot.y, -rot.z))
-                    R = q.to_matrix().to_4x4()
-                    S = Matrix.Diagonal(Vector((scale.x, scale.y, scale.z, 1.0)))
-                    c_mat = parent_mat @ (T @ R @ S)
-                    process_go(c_go, c_mat)
-            except Exception:
-                pass
-
-        # 1. Exact match in indexed GameObjects
-        target_gos = bundle_index["gos"].get(prefab_name.lower(), [])
-
-        # 2. Substring match in indexed GameObjects if exact match not found
-        if not target_gos:
-            for gname, gos in bundle_index["gos"].items():
-                if prefab_name.lower() in gname or gname in prefab_name.lower():
-                    target_gos.extend(gos)
-
-        for go in target_gos:
-            process_go(go)
-
-        # 3. Fallback: only if a mesh specifically matches the prefab name
-        if not extracted_parts:
-            for m_name, m in bundle_index["meshes"].items():
-                if prefab_name.lower() in m_name or m_name in prefab_name.lower():
-                    b_mesh = self._create_blender_mesh(m)
-                    if b_mesh is not None:
-                        b_mat = self._create_blender_material(prefab_name, tex_map, colors)
-                        extracted_parts.append({
-                            "name": m.m_Name,
-                            "mesh": b_mesh,
-                            "material": b_mat,
-                            "local_matrix": Matrix.Identity(4)
-                        })
-                        break
-
-        return extracted_parts
-
-    def _create_blender_mesh(self, unity_mesh, mesh_key=None, transform_mat=None):
-        name_key = mesh_key if mesh_key else unity_mesh.m_Name
-        if name_key in self.mesh_cache:
-            return self.mesh_cache[name_key]
-
-        try:
-            obj_str = unity_mesh.export()
-        except Exception:
-            if self.use_fallback_cubes:
-                return self.create_fallback_cube(name_key)
-            return None
-
-        verts, uvs, faces = [], [], []
-        for line in obj_str.splitlines():
-            if line.startswith("v "):
-                p = line.split()
-                verts.append((float(p[1]), float(p[2]), float(p[3])))
-            elif line.startswith("vt "):
-                p = line.split()
-                uvs.append((float(p[1]), float(p[2])))
-            elif line.startswith("f "):
-                face = [int(p.split("/")[0]) - 1 for p in line.split()[1:]]
-                faces.append(face)
-
-        mesh_data = bpy.data.meshes.new(name_key)
-        mesh_data.from_pydata(verts, [], faces)
-        if transform_mat and transform_mat != Matrix.Identity(4):
-            mesh_data.transform(transform_mat)
-        mesh_data.update()
-
-        if uvs and len(mesh_data.polygons) > 0:
-            uv_layer = mesh_data.uv_layers.new(name="UVMap")
-            loop_idx = 0
-            for poly in mesh_data.polygons:
-                for v_idx in poly.vertices:
-                    if loop_idx < len(uv_layer.data) and v_idx < len(uvs):
-                        uv_layer.data[loop_idx].uv = uvs[v_idx]
-                    loop_idx += 1
-
-        self.mesh_cache[name_key] = mesh_data
-        return mesh_data
-
-    def _create_blender_material(self, item_name: str, tex_map: dict, colors: list):
-        """Creates a standard COM3D2-ready Principled BSDF material with tinted base color texture."""
-        tint_rgb = (1.0, 1.0, 1.0)
-        if colors and len(colors) > 0 and colors[0]:
-            try:
-                c_json = json.loads(colors[0])
-                tint_rgb = (float(c_json.get("r", 1.0)), float(c_json.get("g", 1.0)), float(c_json.get("b", 1.0)))
-            except Exception:
-                pass
-
-        is_tinted = any(abs(c - 1.0) > 0.01 for c in tint_rgb)
-        color_hash = f"{tint_rgb[0]:.2f}_{tint_rgb[1]:.2f}_{tint_rgb[2]:.2f}"
-        mat_name = f"M_{item_name}_{color_hash}"
-
-        if mat_name in self.mat_cache:
-            return self.mat_cache[mat_name]
-
-        mat = bpy.data.materials.new(name=mat_name)
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
-        bsdf = nodes.get("Principled BSDF")
-
-        base_tex = None
-        for tname, tex in tex_map.items():
-            if item_name.lower() in tname or not base_tex:
-                base_tex = tex
-                if item_name.lower() in tname:
-                    break
-
-        if base_tex:
-            try:
-                img_pil = base_tex.image
-                if is_tinted:
-                    img_rgb = img_pil.convert("RGBA")
-                    r, g, b, a = img_rgb.split()
-                    r = r.point(lambda i: int(i * tint_rgb[0]))
-                    g = g.point(lambda i: int(i * tint_rgb[1]))
-                    b = b.point(lambda i: int(i * tint_rgb[2]))
-                    tinted_pil = Image.merge("RGBA", (r, g, b, a))
-                    img_filename = f"{mat_name}.png"
-                    img_path = os.path.join(self.tex_cache_dir, img_filename)
-                    tinted_pil.save(img_path)
-                else:
-                    img_filename = f"T_{base_tex.m_Name}.png"
-                    img_path = os.path.join(self.tex_cache_dir, img_filename)
-                    if not os.path.exists(img_path):
-                        img_pil.save(img_path)
-
-                b_img = bpy.data.images.load(img_path, check_existing=True)
-                tex_node = nodes.new(type="ShaderNodeTexImage")
-                tex_node.image = b_img
-                tex_node.location = (-300, 200)
-                if bsdf:
-                    links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
-            except Exception:
-                if bsdf:
-                    bsdf.inputs["Base Color"].default_value = (tint_rgb[0], tint_rgb[1], tint_rgb[2], 1.0)
-        else:
-            if bsdf:
-                bsdf.inputs["Base Color"].default_value = (tint_rgb[0], tint_rgb[1], tint_rgb[2], 1.0)
-
-        self.mat_cache[mat_name] = mat
-        return mat
-
-    def create_fallback_cube(self, name: str):
-        mesh_name = f"Placeholder_{name}"
-        if mesh_name in self.mesh_cache:
-            return self.mesh_cache[mesh_name]
-        mesh_data = bpy.data.meshes.new(mesh_name)
-        verts = [(-0.5,-0.5,-0.5), (0.5,-0.5,-0.5), (0.5,0.5,-0.5), (-0.5,0.5,-0.5),
-                 (-0.5,-0.5,0.5), (0.5,-0.5,0.5), (0.5,0.5,0.5), (-0.5,0.5,0.5)]
-        faces = [(0,1,2,3), (4,7,6,5), (0,4,5,1), (1,5,6,2), (2,6,7,3), (4,0,3,7)]
-        mesh_data.from_pydata(verts, [], faces)
-        mesh_data.update()
-        self.mesh_cache[mesh_name] = mesh_data
-        return mesh_data
-
-
-def load_base_skeleton_data():
-    addon_dir = os.path.dirname(os.path.abspath(__file__))
-    sk_path = os.path.join(addon_dir, "kk_base_skeleton.json")
-    maps_path = os.path.join(addon_dir, "kk_studio_bone_maps.json")
-    if not os.path.exists(sk_path) or not os.path.exists(maps_path):
-        return None, None, None
-    try:
-        with open(sk_path, "r", encoding="utf-8") as f:
-            sk = json.load(f)
-        with open(maps_path, "r", encoding="utf-8") as f:
-            mp = json.load(f)
-        acc_m = {int(k): v for k, v in mp.get("accessory_points", {}).items()}
-        bone_m = {int(k): v for k, v in mp.get("bones", {}).items()}
-        return sk, acc_m, bone_m
-    except Exception:
-        return None, None, None
-
-
-# =========================================================================
-# 4. Binary Tree & ExtendedSave Parser
-# =========================================================================
-
-class KKStudioParser:
-    def __init__(self, scene_path: str):
-        self.scene_path = scene_path
-        with open(scene_path, "rb") as f:
-            self.data = f.read()
-
-        self.tree_names = {}
-        self.uar_items = {}
-        self.parsed_tree = {} # dic_key -> dict
-        self._parse_extsave()
-        self._parse_binary_tree()
-
-    def _parse_extsave(self):
-        pos = self.data.rfind(b"KKEx")
-        if pos == -1:
-            return
-        stream = io.BytesIO(self.data[pos + 4:])
-        try:
-            version, length = struct.unpack("<II", stream.read(8))
-            mp = stream.read(length)
-            plugins = msgpack.unpackb(mp, raw=False, strict_map_key=False)
-
-            tnn = plugins.get("org.njaecha.plugins.treenodenaming", [])
-            if len(tnn) > 1 and "names" in tnn[1]:
-                self.tree_names = msgpack.unpackb(tnn[1]["names"], raw=False, strict_map_key=False)
-
-            uar = plugins.get("com.bepis.sideloader.universalautoresolver", [])
-            if len(uar) > 1:
-                for item_raw in uar[1].get("itemInfo", []):
-                    it = msgpack.unpackb(item_raw, raw=False, strict_map_key=False)
-                    dic_key = it.get("SceneDicKey")
-                    if dic_key is not None:
-                        self.uar_items[dic_key] = it
-        except Exception:
-            pass
-
-    def _parse_binary_tree(self):
-        iend_pos = self.data.find(b"IEND") + 8
-        s = io.BytesIO(self.data[iend_pos:])
-
-        def rs():
-            l, sh = 0, 0
-            while True:
-                b = s.read(1)[0]
-                l |= (b & 0x7F) << sh
-                if not (b & 0x80): break
-                sh += 7
-            return s.read(l).decode("utf-8", errors="ignore")
-
-        def r_v3(): return struct.unpack("<fff", s.read(12))
-        def r_b(): return struct.unpack("<?", s.read(1))[0]
-        def r_i(): return struct.unpack("<i", s.read(4))[0]
-        def r_f(): return struct.unpack("<f", s.read(4))[0]
-
-        def get_png_size():
-            start = s.tell()
-            sig = s.read(8)
-            if sig != b"\x89PNG\r\n\x1a\n":
-                s.seek(start)
-                return 0
-            while True:
-                len_bytes = s.read(4)
-                if len(len_bytes) < 4: break
-                chunk_len = struct.unpack(">I", len_bytes)[0]
-                chunk_type = s.read(4)
-                s.seek(chunk_len + 4, io.SEEK_CUR)
-                if chunk_type == b"IEND":
-                    break
-            end = s.tell()
-            return end - start
-
-        version = rs()
-        root_count = r_i()
-
-        def parse_obj_base(other=True):
-            dic_key = r_i()
-            pos = r_v3()
-            rot = r_v3()
-            scale = r_v3()
-            if other:
-                tree_state = r_i()
-                visible = r_b()
-            else:
-                visible = True
-            return dic_key, pos, rot, scale, visible
-
-        def parse_pattern():
-            key = r_i()
-            fpath = rs()
-            clamp = r_b()
-            uv_str = rs()
-            rot = r_f()
-
-        def parse_child(parent_key):
-            child_count = r_i()
-            for _ in range(child_count):
-                ckind = r_i()
-                parse_node(ckind, parent_key)
-
-        def parse_node(kind, parent_key, attach_point=None):
-            dic_key, pos, rot, scale, visible = parse_obj_base(other=True)
-            node = {
-                "dic_key": dic_key, "kind": kind, "parent_key": parent_key,
-                "attach_point": attach_point,
-                "pos": pos, "rot": rot, "scale": scale, "visible": visible
-            }
-            self.parsed_tree[dic_key] = node
-
-            if kind == 3: # Folder
-                node["name"] = rs()
-                parse_child(dic_key)
-
-            elif kind == 1: # Item
-                node["group"] = r_i()
-                node["category"] = r_i()
-                node["no"] = r_i()
-                anime_speed = r_f()
-                colors = [rs() for _ in range(8)]
-                node["colors"] = colors
-                for _ in range(3): parse_pattern()
-                alpha = r_f()
-                line_color = rs()
-                line_width = r_f()
-                emission_color = rs()
-                emission_power = r_f()
-                light_cancel = r_f()
-                parse_pattern()
-                enable_fk = r_b()
-                bone_count = r_i()
-                bones = {}
-                for _ in range(bone_count):
-                    bname = rs()
-                    b_key = r_i()
-                    b_pos = r_v3()
-                    b_rot = r_v3()
-                    b_scale = r_v3()
-                    bones[bname] = {"key": b_key, "pos": b_pos, "rot": b_rot, "scale": b_scale}
-                node["bones"] = bones
-                node["enable_fk"] = enable_fk
-                enable_db = r_b()
-                anime_nml_time = r_f()
-                parse_child(dic_key)
-
-            elif kind == 2: # Light
-                no = r_i()
-                c_r, c_g, c_b, c_a = struct.unpack("<ffff", s.read(16))
-                intensity = r_f()
-                range_val = r_f()
-                spot_angle = r_f()
-                shadow = r_b()
-                enable = r_b()
-                draw_target = r_b()
-                node["name"] = f"Light_{dic_key}"
-
-            elif kind == 4: # Route
-                node["name"] = rs()
-                parse_child(dic_key)
-                pt_count = r_i()
-                for _ in range(pt_count):
-                    parse_obj_base(other=True)
-                active = r_b()
-                loop = r_b()
-                vis_line = r_b()
-                orient = r_i()
-                color_str = rs()
-
-            elif kind == 5: # Camera
-                node["name"] = rs()
-                active = r_b()
-
-            elif kind == 0: # Character
-                node["name"] = f"Character_{dic_key}"
-                sex = r_i()
-                png_size = get_png_size()
-                prod_no = r_i()
-                chara_tag = rs()
-                chara_ver = rs()
-                face_len = r_i()
-                if face_len > 0:
-                    s.seek(face_len, io.SEEK_CUR)
-                header_len = r_i()
-                header_data = s.read(header_len)
-                total_block_size = struct.unpack("<q", s.read(8))[0]
-                s.seek(total_block_size, io.SEEK_CUR)
-
-                # Bones (44 bytes per bone)
-                bone_count = r_i()
-                node["bone_count"] = bone_count
-                node["bones"] = {}
-                for _ in range(bone_count):
-                    b_key = r_i(); b_dickey = r_i(); b_pos = r_v3(); b_rot = r_v3(); b_scale = r_v3()
-                    node["bones"][b_key] = {"dic_key": b_dickey, "pos": b_pos, "rot": b_rot, "scale": b_scale}
-
-                # IK (44 bytes per ik)
-                ik_count = r_i()
-                node["ik_count"] = ik_count
-                for _ in range(ik_count):
-                    ik_key = r_i(); ik_dickey = r_i(); ik_pos = r_v3(); ik_rot = r_v3(); ik_scale = r_v3()
-
-                # Attached child props on character bones!
-                child_dict_count = r_i()
-                for _ in range(child_dict_count):
-                    attach_point = r_i()
-                    child_list_count = r_i()
-                    for _ in range(child_list_count):
-                        ckind = r_i()
-                        parse_node(ckind, dic_key, attach_point)
-
-                # Rest of character data
-                kinematic_mode = r_i()
-                node["anim_group"] = r_i()
-                node["anim_cat"] = r_i()
-                node["anim_no"] = r_i()
-                hptn0 = r_i(); hptn1 = r_i()
-                nipple = r_f()
-                siru = s.read(5)
-                mouth_open = r_f()
-                lip_sync = r_b()
-                lookat_obj = parse_obj_base(other=False)
-                enable_ik = r_b()
-                for _ in range(5): r_b()
-                enable_fk = r_b()
-                for _ in range(7): r_b()
-                for _ in range(8): r_b()
-                anime_speed = r_f()
-                anime_pattern = r_f()
-                anime_opt_vis = r_b()
-                anime_force_loop = r_b()
-
-                voice_count = r_i()
-                for _ in range(voice_count):
-                    r_i(); r_i(); r_i()
-                voice_repeat = r_i()
-
-                visible_son = r_b()
-                son_length = r_f()
-                visible_simple = r_b()
-                simple_color = rs()
-                opt0 = r_f(); opt1 = r_f()
-                neck_len = r_i()
-                if neck_len > 0: s.seek(neck_len, io.SEEK_CUR)
-                eyes_len = r_i()
-                if eyes_len > 0: s.seek(eyes_len, io.SEEK_CUR)
-                anime_nml_time = r_f()
-                acc_grp_cnt = r_i()
-                for _ in range(acc_grp_cnt):
-                    r_i(); r_i()
-                acc_no_cnt = r_i()
-                for _ in range(acc_no_cnt):
-                    r_i(); r_i()
-
-        try:
-            for _ in range(root_count):
-                k = r_i()
-                kind = r_i()
-                parse_node(kind, None)
-        except Exception:
-            pass
-
-
-# =========================================================================
-# 5. Blender Operators & UI
+# 2. Blender Operators & UI
 # =========================================================================
 
 class KK_OT_ReindexDatabase(bpy.types.Operator):
@@ -981,83 +244,99 @@ class KK_OT_ImportScene(bpy.types.Operator):
             # Compute Forward Kinematics for Characters if skeleton data is available
             skeleton, acc_map, bone_map = load_base_skeleton_data()
             name_to_bone_idx = {v: k for k, v in bone_map.items()} if bone_map else {}
-            char_fk = {}
+            C_flip = Matrix.Diagonal(Vector((-1.0, 1.0, 1.0, 1.0)))
 
+            char_posed_u = {}
+            char_skeletons = {}
             if skeleton:
                 for dic_key, node in parser.parsed_tree.items():
                     if node.get("kind") == 0:
-                        c_pos = Vector(node.get("pos", (0, 0, 0)))
-                        c_rot = node.get("rot", (0, 0, 0))
-                        c_q = Euler((math.radians(c_rot[0]), math.radians(c_rot[1]), math.radians(c_rot[2])), 'ZXY').to_quaternion()
-                        c_scale = Vector(node.get("scale", (1, 1, 1)))
+                        char_sk = build_char_skeleton(skeleton, node)
+                        char_skeletons[dic_key] = char_sk
                         char_bones = node.get("bones", {})
-
-                        bone_world = {}
-                        def get_bw(b_name):
-                            if b_name in bone_world:
-                                return bone_world[b_name]
-                            info = skeleton[b_name]
-                            p_name = info['p']
+                        r_hand_active = (
+                            char_bones.get(22, {}).get("rot", (0.0, 0.0, 0.0)) != (0.0, 0.0, 0.0)
+                            or char_bones.get(25, {}).get("rot", (0.0, 0.0, 0.0)) != (0.0, 0.0, 0.0)
+                        )
+                        l_hand_active = (
+                            char_bones.get(37, {}).get("rot", (0.0, 0.0, 0.0)) != (0.0, 0.0, 0.0)
+                            or char_bones.get(40, {}).get("rot", (0.0, 0.0, 0.0)) != (0.0, 0.0, 0.0)
+                        )
+                        p_u = {}
+                        def get_p_u(b):
+                            if b in p_u: return p_u[b]
+                            info = char_sk[b]
+                            p = info['p']
                             t = Vector(info['t'])
-                            q = Quaternion((info['r'][3], info['r'][0], info['r'][1], info['r'][2]))
-                            s = Vector(info['s'])
-
-                            b_idx = name_to_bone_idx.get(b_name)
+                            r = Quaternion((info['r'][3], info['r'][0], info['r'][1], info['r'][2]))
+                            s = Vector(info.get('s', [1.0, 1.0, 1.0]))
+                            b_idx = name_to_bone_idx.get(b)
                             if b_idx is not None and b_idx in char_bones:
-                                fk_rot = char_bones[b_idx]["rot"]
-                                fk_q = Euler((math.radians(fk_rot[0]), math.radians(fk_rot[1]), math.radians(fk_rot[2])), 'ZXY').to_quaternion()
-                                q = q @ fk_q
-
-                            if p_name and p_name in skeleton:
-                                p_pos, p_q, p_scale = get_bw(p_name)
-                                scaled_offset = Vector((t.x * p_scale.x, t.y * p_scale.y, t.z * p_scale.z))
-                                w_pos = p_pos + (p_q @ scaled_offset)
-                                w_q = p_q @ q
-                                w_scale = Vector((p_scale.x * s.x, p_scale.y * s.y, p_scale.z * s.z))
-                            else:
-                                scaled_offset = Vector((t.x * c_scale.x, t.y * c_scale.y, t.z * c_scale.z))
-                                w_pos = c_pos + (c_q @ scaled_offset)
-                                w_q = c_q @ q
-                                w_scale = Vector((c_scale.x * s.x, c_scale.y * s.y, c_scale.z * s.z))
-                            bone_world[b_name] = (w_pos, w_q, w_scale)
-                            return bone_world[b_name]
-
-                        for b_name in skeleton:
-                            get_bw(b_name)
-                        char_fk[dic_key] = bone_world
+                                skip_fk = (22 <= b_idx <= 36 and not r_hand_active) or (37 <= b_idx <= 51 and not l_hand_active)
+                                if not skip_fk:
+                                    b_data = char_bones[b_idx]
+                                    rot = b_data["rot"]
+                                    q_fk = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_quaternion()
+                                    r = q_fk
+                                    t = t + Vector(b_data.get("pos", (0.0, 0.0, 0.0)))
+                                    b_s = b_data.get("scale", (1.0, 1.0, 1.0))
+                                    s = Vector((s.x * b_s[0], s.y * b_s[1], s.z * b_s[2]))
+                            abm_rot = info.get("abm_rot")
+                            if abm_rot:
+                                q_abm = Euler((math.radians(abm_rot[0]), math.radians(abm_rot[1]), math.radians(abm_rot[2])), 'ZXY').to_quaternion()
+                                r = r @ q_abm
+                            S_mat = Matrix.Diagonal(Vector((s.x, s.y, s.z, 1.0)))
+                            m = Matrix.Translation(t) @ r.to_matrix().to_4x4() @ S_mat
+                            if p and p in char_sk: m = get_p_u(p) @ m
+                            p_u[b] = m
+                            return m
+                        for b in char_sk: get_p_u(b)
+                        char_posed_u[dic_key] = p_u
 
             # Compute absolute Unity world transforms (canceling scale inheritance to match KK Studio LateUpdate)
+            # and track character bone attachments
             unity_world = {}
+            char_attachments = {} # dic_key -> (char_key, attach_bone_name, m_in_char_u)
+
             for k in eval_order:
                 node = parser.parsed_tree[k]
                 pos = node["pos"]
                 rot = node["rot"]
                 scale = node["scale"]
+                pk = node.get("parent_key")
 
+                # Direct character bone attachment
+                if pk is not None and pk in parser.parsed_tree and parser.parsed_tree[pk].get("kind") == 0:
+                    ap_idx = node.get("attach_point")
+                    ap_name = acc_map.get(ap_idx) if acc_map else None
+                    if ap_name and pk in char_posed_u and ap_name in char_posed_u[pk]:
+                        m_bone_u = char_posed_u[pk][ap_name]
+                        t_u = Vector(pos)
+                        r_u = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_matrix().to_4x4()
+                        s_u = Matrix.Diagonal(Vector((scale[0], scale[1], scale[2], 1.0)))
+                        m_local_u = Matrix.Translation(t_u) @ r_u @ s_u
+                        m_in_char_u = m_bone_u @ m_local_u
+                        char_attachments[k] = (pk, ap_name, m_in_char_u)
+                        continue
+
+                # Indirect character attachment (descendant of an attached prop)
+                if pk is not None and pk in char_attachments:
+                    char_key, _, parent_m_in_char_u = char_attachments[pk]
+                    t_u = Vector(pos)
+                    r_u = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_matrix().to_4x4()
+                    s_u = Matrix.Diagonal(Vector((scale[0], scale[1], scale[2], 1.0)))
+                    m_local_u = Matrix.Translation(t_u) @ r_u @ s_u
+                    m_in_char_u = parent_m_in_char_u @ m_local_u
+                    char_attachments[k] = (char_key, None, m_in_char_u)
+                    continue
+
+                # Normal scene object / room hierarchy
                 rx = math.radians(rot[0])
                 ry = math.radians(-rot[1])
                 rz = math.radians(-rot[2])
                 local_q = Euler((rx, ry, rz), 'ZXY').to_quaternion()
                 local_pos = Vector((-pos[0], pos[1], pos[2]))
                 local_scale = Vector((scale[0], scale[1], scale[2]))
-
-                pk = node.get("parent_key")
-                if pk is not None and pk in parser.parsed_tree and parser.parsed_tree[pk].get("kind") == 0:
-                    ap_idx = node.get("attach_point")
-                    ap_name = acc_map.get(ap_idx) if acc_map else None
-                    if ap_name and pk in char_fk and ap_name in char_fk[pk]:
-                        ap_pos, ap_q, ap_scale = char_fk[pk][ap_name]
-                        i_pos_u = Vector(pos)
-                        scaled_offset_u = Vector((i_pos_u.x * ap_scale.x, i_pos_u.y * ap_scale.y, i_pos_u.z * ap_scale.z))
-                        w_pos_u = ap_pos + (ap_q @ scaled_offset_u)
-                        i_rot_u = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_quaternion()
-                        w_q_u = ap_q @ i_rot_u
-
-                        bl_w_pos = Vector((-w_pos_u.x, w_pos_u.y, w_pos_u.z))
-                        bl_e = w_q_u.to_euler('ZXY')
-                        bl_w_q = Euler((bl_e.x, -bl_e.y, -bl_e.z), 'ZXY').to_quaternion()
-                        unity_world[k] = (bl_w_pos, bl_w_q, local_scale)
-                        continue
 
                 if pk is not None and pk in unity_world:
                     p_pos, p_q, p_scale = unity_world[pk]
@@ -1070,6 +349,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     unity_world[k] = (local_pos, local_q, local_scale)
 
             single_part_matrices = {}
+            pending_com_transfers = []
 
             for dic_key in eval_order:
                 node = parser.parsed_tree[dic_key]
@@ -1078,63 +358,146 @@ class KK_OT_ImportScene(bpy.types.Operator):
 
                 kind = node["kind"]
                 if kind in [3, 0, 4, 5]: # Folder, Character, Route, Camera
+                    if not props.import_attached_props and dic_key in char_attachments:
+                        continue
+
                     display_name = parser.tree_names.get(dic_key, node.get("name", f"Node_{dic_key}"))
                     target_col = folder_cols.get(dic_key) if kind == 3 else get_target_collection(dic_key)
 
-                    if kind == 0 and skeleton:
+                    if kind == 0 and skeleton and props.import_character_pose:
+                        char_sk = char_skeletons.get(dic_key) or build_char_skeleton(skeleton, node)
                         arm_data = bpy.data.armatures.new(f"{display_name}_Armature")
+                        arm_data.display_type = 'OCTAHEDRAL'
                         arm_obj = bpy.data.objects.new(display_name, arm_data)
+                        arm_obj.show_in_front = True
                         target_col.objects.link(arm_obj)
                         context.view_layer.objects.active = arm_obj
-                        bpy.ops.object.mode_set(mode='EDIT')
 
-                        rest_unity = {}
-                        def get_unity_rest(b_name):
-                            if b_name in rest_unity: return rest_unity[b_name]
-                            info = skeleton[b_name]
-                            p_name = info['p']
+                        # Compute rest matrices in character local space (with character height/body sliders and ABMX bone scales/lengths)
+                        rest_u = {}
+                        def get_rest_u(b):
+                            if b in rest_u: return rest_u[b]
+                            info = char_sk[b]
+                            p = info['p']
                             t = Vector(info['t'])
                             r = Quaternion((info['r'][3], info['r'][0], info['r'][1], info['r'][2]))
-                            m_local = Matrix.Translation(t) @ r.to_matrix().to_4x4()
-                            if p_name and p_name in skeleton:
-                                m_world = get_unity_rest(p_name) @ m_local
-                            else:
-                                m_world = m_local
-                            rest_unity[b_name] = m_world
-                            return m_world
+                            s = Vector(info.get('s', [1.0, 1.0, 1.0]))
+                            S_mat = Matrix.Diagonal(Vector((s.x, s.y, s.z, 1.0)))
+                            m = Matrix.Translation(t) @ r.to_matrix().to_4x4() @ S_mat
+                            if p and p in char_sk: m = get_rest_u(p) @ m
+                            rest_u[b] = m
+                            return m
+                        for b in char_sk: get_rest_u(b)
 
-                        for b_name in skeleton: get_unity_rest(b_name)
+                        posed_u = char_posed_u.get(dic_key, {})
 
-                        created_eb = {}
-                        for b_name in skeleton:
+                        rest_bl = {b: C_flip @ rest_u[b] @ C_flip for b in char_sk}
+                        posed_bl = {b: C_flip @ posed_u[b] @ C_flip for b in char_sk}
+
+                        # Compute pure world rotation delta for each bone from rest pose to posed pose
+                        delta_R_bl = {}
+                        for b in char_sk:
+                            R_delta_u = posed_u[b].to_quaternion().to_matrix() @ rest_u[b].to_quaternion().to_matrix().inverted()
+                            delta_R_bl[b] = C_flip.to_3x3() @ R_delta_u @ C_flip.to_3x3()
+
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        eb_map = {}
+                        for b_name in char_sk:
                             eb = arm_data.edit_bones.new(b_name)
-                            m_u = rest_unity[b_name]
-                            head_pos = Vector((-m_u[0][3], m_u[1][3], m_u[2][3]))
-                            eb.head = head_pos
-                            eb.tail = head_pos + Vector((0, 0, 0.02))
-                            created_eb[b_name] = eb
+                            m_bl = rest_bl[b_name]
+                            eb.head = m_bl.translation
+                            eb.tail = m_bl.translation + Vector((0, 0, 0.05))
+                            eb_map[b_name] = eb
 
-                        for b_name, info in skeleton.items():
+                        for b_name, info in char_sk.items():
                             p_name = info['p']
-                            if p_name and p_name in created_eb:
-                                created_eb[b_name].parent = created_eb[p_name]
+                            if p_name and p_name in eb_map:
+                                eb_map[b_name].parent = eb_map[p_name]
+
+                        for b_name in char_sk:
+                            eb = eb_map[b_name]
+                            if b_name in ['cf_j_root', 'cf_n_height']:
+                                eb.tail = eb.head + Vector((0.0, 0.0, 0.1))
+                                continue
+                            if b_name in KK_PRIMARY_BONE_CHAIN and KK_PRIMARY_BONE_CHAIN[b_name] in eb_map:
+                                target = eb_map[KK_PRIMARY_BONE_CHAIN[b_name]]
+                                if (target.head - eb.head).length > 0.01:
+                                    eb.tail = target.head
+                                    continue
+                            children = eb.children
+                            if len(children) == 1:
+                                if (children[0].head - eb.head).length > 0.01:
+                                    eb.tail = children[0].head
+                            elif len(children) > 1:
+                                best = None
+                                for c in children:
+                                    if c.name.startswith('cf_j_'):
+                                        best = c
+                                        break
+                                if not best:
+                                    for c in children:
+                                        if any(k in c.name for k in ['spine', 'neck', 'head', 'arm', 'forearm', 'hand', 'thigh', 'leg', 'foot']):
+                                            best = c
+                                            break
+                                if not best: best = children[0]
+                                if (best.head - eb.head).length > 0.01:
+                                    eb.tail = best.head
+                            else:
+                                if eb.parent:
+                                    d = (eb.head - eb.parent.head).normalized()
+                                    if d.length > 0.1: eb.tail = eb.head + d * 0.05
 
                         bpy.ops.object.mode_set(mode='POSE')
+                        E_rest = {b: arm_data.bones[b].matrix_local for b in char_sk}
+
+                        P_target = {}
+                        for b in char_sk:
+                            E_b = E_rest[b]
+                            R_b = (delta_R_bl[b] @ E_b.to_3x3()).to_4x4()
+                            R_b.translation = posed_bl[b].translation
+                            P_target[b] = R_b
+
+                        def get_bone_order():
+                            vis, ord = set(), []
+                            def v(b):
+                                if b in vis or b not in char_sk: return
+                                vis.add(b)
+                                p = char_sk[b]['p']
+                                if p and p in char_sk: v(p)
+                                ord.append(b)
+                            for b in char_sk: v(b)
+                            return ord
+
+                        bone_eval_order = get_bone_order()
                         pose_bones = arm_obj.pose.bones
-                        for b_idx, b_info in node.get("bones", {}).items():
-                            b_name = bone_map.get(b_idx) if bone_map else None
-                            if b_name and b_name in pose_bones:
-                                pb = pose_bones[b_name]
-                                b_rot = b_info["rot"]
-                                pb.rotation_mode = 'ZXY'
-                                pb.rotation_euler = Euler((
-                                    math.radians(b_rot[0]),
-                                    math.radians(-b_rot[1]),
-                                    math.radians(-b_rot[2])
-                                ), 'ZXY')
+
+                        for b in bone_eval_order:
+                            pb = pose_bones.get(b)
+                            if not pb: continue
+                            info = char_sk[b]
+                            p = info['p']
+                            if p and p in char_sk and p in pose_bones:
+                                E_b = E_rest[b]
+                                E_p = E_rest[p]
+                                P_b = P_target[b]
+                                P_p = P_target[p]
+                                M_basis = E_b.inverted() @ E_p @ P_p.inverted() @ P_b
+                            else:
+                                E_b = E_rest[b]
+                                P_b = P_target[b]
+                                M_basis = E_b.inverted() @ P_b
+
+                            pb.rotation_mode = 'QUATERNION'
+                            loc, rot, sca = M_basis.decompose()
+                            pb.location = loc
+                            pb.rotation_quaternion = rot
+                            pb.scale = sca
 
                         bpy.ops.object.mode_set(mode='OBJECT')
                         created_objects[dic_key] = arm_obj
+
+                        if props.transfer_to_com_body:
+                            pending_com_transfers.append((arm_obj, target_col))
                     else:
                         empty = bpy.data.objects.new(display_name, None)
                         if kind == 3:
@@ -1147,7 +510,8 @@ class KK_OT_ImportScene(bpy.types.Operator):
                         created_objects[dic_key] = empty
 
                     is_vis = node.get("visible", True)
-                    if not is_vis:
+                    # Don't hide character armatures if user requested character poses
+                    if not is_vis and kind != 0:
                         created_objects[dic_key].hide_viewport = True
                         created_objects[dic_key].hide_render = True
 
@@ -1156,6 +520,8 @@ class KK_OT_ImportScene(bpy.types.Operator):
             total_items = len(item_keys)
 
             for item_idx, dic_key in enumerate(item_keys):
+                if not props.import_attached_props and dic_key in char_attachments:
+                    continue
                 node = parser.parsed_tree[dic_key]
                 current_progress += 1
                 wm.progress_update(current_progress)
@@ -1170,13 +536,13 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     uar_guid, uar_slot, custom_name
                 )
 
-                # Determine actual object name with unique _dic_key suffix
-                if custom_name:
+                # Determine actual object name prioritizing KK Prefab name, keeping _[dic_key]
+                if item_def and item_def.get("prefab"):
+                    base_name = item_def["prefab"]
+                elif custom_name:
                     base_name = custom_name
                 elif item_def and item_def.get("name"):
                     base_name = item_def["name"]
-                elif item_def and item_def.get("prefab"):
-                    base_name = item_def["prefab"]
                 else:
                     base_name = "Item"
 
@@ -1286,6 +652,14 @@ class KK_OT_ImportScene(bpy.types.Operator):
 
                     return arm_obj, mesh_obj
 
+                def assign_object_material(target_obj, mat):
+                    if not mat:
+                        return
+                    if not target_obj.material_slots:
+                        target_obj.data.materials.append(None)
+                    target_obj.material_slots[0].link = 'OBJECT'
+                    target_obj.material_slots[0].material = mat
+
                 if len(parts) == 1:
                     part = parts[0]
                     if part.get("armature_data"):
@@ -1293,8 +667,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                         created_objects[dic_key] = arm_obj
                     else:
                         obj = bpy.data.objects.new(display_name, part["mesh"])
-                        if part.get("material"):
-                            obj.data.materials.append(part["material"])
+                        assign_object_material(obj, part.get("material"))
                         target_col.objects.link(obj)
                         created_objects[dic_key] = obj
                         if not is_vis:
@@ -1321,8 +694,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                             arm_obj.matrix_basis = part_lmat
                         else:
                             sub_obj = bpy.data.objects.new(sub_name, part["mesh"])
-                            if part.get("material"):
-                                sub_obj.data.materials.append(part["material"])
+                            assign_object_material(sub_obj, part.get("material"))
                             target_col.objects.link(sub_obj)
                             sub_obj.parent = parent_obj
                             sub_obj.matrix_basis = part_lmat
@@ -1353,29 +725,74 @@ class KK_OT_ImportScene(bpy.types.Operator):
                 parent_key = node.get("parent_key")
                 parent_obj = created_objects.get(parent_key) if parent_key is not None else None
 
-                w_pos, w_q, w_scale = unity_world[dic_key]
-                T = Matrix.Translation(w_pos)
-                R = w_q.to_matrix().to_4x4()
-                S = Matrix.Diagonal(Vector((w_scale.x, w_scale.y, w_scale.z, 1.0)))
-                unity_mw = T @ R @ S
+                if dic_key in char_attachments:
+                    char_key, ap_name, m_in_char_u = char_attachments[dic_key]
+                    char_obj = created_objects.get(char_key)
 
-                if dic_key in single_part_matrices:
-                    l_mat = single_part_matrices[dic_key]
-                    if l_mat != Matrix.Identity(4):
-                        unity_mw = unity_mw @ l_mat
+                    m_in_char_bl = C_flip @ m_in_char_u @ C_flip
+                    if dic_key in single_part_matrices:
+                        l_mat = single_part_matrices[dic_key]
+                        if l_mat != Matrix.Identity(4):
+                            m_in_char_bl = m_in_char_bl @ l_mat
 
-                blender_mw = root_mw @ unity_mw
+                    char_mw = char_obj.matrix_world if char_obj else scene_root.matrix_world
+                    blender_mw = char_mw @ m_in_char_bl
 
-                if parent_obj and obj != parent_obj:
-                    obj.parent = parent_obj
-                    obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+                    if parent_obj and parent_obj != char_obj and obj != parent_obj:
+                        obj.parent = parent_obj
+                        obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+                    elif char_obj and char_obj.type == 'ARMATURE' and ap_name and ap_name in char_obj.pose.bones:
+                        obj.parent = char_obj
+                        obj.parent_type = 'BONE'
+                        obj.parent_bone = ap_name
+                        bone_mw = char_obj.matrix_world @ char_obj.pose.bones[ap_name].matrix
+                        obj.matrix_parent_inverse = bone_mw.inverted()
+                    elif char_obj and obj != char_obj:
+                        obj.parent = char_obj
+                        obj.matrix_parent_inverse = char_obj.matrix_world.inverted()
+                    else:
+                        obj.parent = scene_root
+                        obj.matrix_parent_inverse = scene_root.matrix_world.inverted()
+
+                    obj.matrix_world = blender_mw
+
                 else:
-                    obj.parent = scene_root
-                    obj.matrix_parent_inverse = scene_root.matrix_world.inverted()
+                    w_pos, w_q, w_scale = unity_world[dic_key]
+                    T = Matrix.Translation(w_pos)
+                    R = w_q.to_matrix().to_4x4()
+                    S = Matrix.Diagonal(Vector((w_scale.x, w_scale.y, w_scale.z, 1.0)))
+                    unity_mw = T @ R @ S
 
-                obj.matrix_world = blender_mw
+                    if dic_key in single_part_matrices:
+                        l_mat = single_part_matrices[dic_key]
+                        if l_mat != Matrix.Identity(4):
+                            unity_mw = unity_mw @ l_mat
+
+                    blender_mw = root_mw @ unity_mw
+
+                    if parent_obj and obj != parent_obj:
+                        obj.parent = parent_obj
+                        obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+                    else:
+                        obj.parent = scene_root
+                        obj.matrix_parent_inverse = scene_root.matrix_world.inverted()
+
+                    obj.matrix_world = blender_mw
 
             bpy.context.view_layer.update()
+
+            if pending_com_transfers:
+                com_blend = find_com_append_blend()
+                if com_blend:
+                    for arm_obj, target_col in pending_com_transfers:
+                        com_arm, com_mesh = append_com_body(com_blend, target_col)
+                        com_arm.show_in_front = True
+                        if com_mesh:
+                            com_mesh.hide_viewport = False
+                            com_mesh.hide_render = False
+                        setup_kk_to_com_transfer(arm_obj, com_arm)
+                else:
+                    print("[KK Importer] CM3D2 Converter append_data.blend not found. Skipping COM transfer.")
 
             # 5. Fifth Pass: Apply Inactive Visibility to Folder Collections
             def set_collection_visibility(layer_col, target_col, visible):
@@ -1406,6 +823,10 @@ class KK_OT_ImportScene(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# =========================================================================
+# 3. Property Definitions & UI Panels
+# =========================================================================
+
 class KKStudioSceneProperties(bpy.types.PropertyGroup):
     kk_dir: StringProperty(
         name="Koikatsu Path",
@@ -1419,10 +840,20 @@ class KKStudioSceneProperties(bpy.types.PropertyGroup):
         default=r"K:\KK\UserData\Studio\scene\2026_0222_2203_14_452.png",
         subtype='FILE_PATH'
     )
+    import_character_pose: BoolProperty(
+        name="Import Character Pose",
+        description="Build posed KK character armature from scene FK data",
+        default=True
+    )
+    transfer_to_com_body: BoolProperty(
+        name="Transfer to COM Body",
+        description="Append lightweight COM body and retarget the pose via driver constraints",
+        default=False
+    )
     import_attached_props: BoolProperty(
         name="Import Attached Props",
         description="Load props attached to characters (body/clothes ignored)",
-        default=False
+        default=True
     )
     import_meshless: BoolProperty(
         name="Import Meshless Objects",
@@ -1460,7 +891,13 @@ class KK_PT_StudioImporterPanel(bpy.types.Panel):
         box.operator("kk_studio.reindex_database", text="Re-index Asset Cache", icon='FILE_REFRESH')
 
         box = layout.box()
-        box.label(text="Settings:", icon='PREFERENCES')
+        box.label(text="Character & COM Pose:", icon='ARMATURE_DATA')
+        box.prop(props, "import_character_pose")
+        box.prop(props, "transfer_to_com_body")
+        box.operator("kk_studio.transfer_to_com", text="Retarget Active Rig to COM", icon='CON_ROTLIMIT')
+
+        box = layout.box()
+        box.label(text="Scene Props:", icon='PREFERENCES')
         box.prop(props, "import_attached_props")
         box.prop(props, "import_meshless")
         box.prop(props, "use_fallback_cubes")
@@ -1468,11 +905,19 @@ class KK_PT_StudioImporterPanel(bpy.types.Panel):
         layout.separator()
         layout.operator("kk_studio.import_scene", text="Import Studio Scene", icon='IMPORT')
 
+        box = layout.box()
+        box.label(text="COM3D2 Merge & Prep (Selected):", icon='MOD_SOLIDIFY')
+        box.operator("kk_studio.clean_occluded_geometry", text="Clean Occluded Geometry", icon='BRUSH_DATA')
+        box.operator("kk_studio.merge_selected_props", text="Merge Selected into .model Mesh", icon='AUTOMERGE_ON')
+
 
 classes = (
     KKStudioSceneProperties,
     KK_OT_ReindexDatabase,
+    KK_OT_TransferToCOM,
     KK_OT_ImportScene,
+    KK_OT_CleanOccludedGeometry,
+    KK_OT_MergeSelectedProps,
     KK_PT_StudioImporterPanel,
 )
 
