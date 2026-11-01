@@ -4,9 +4,14 @@ Blender 3.0+ add-on to import Koikatsu Studio scene cards (.png) directly into B
 
 ## Branches
 - main: **v1.4.1** - Stable version. Imports scene props and environment cleanly without characters.
-- test-char-pose: **v1.5.2** - Character armature generation with embedded body slider and KKABMX bone modifier resizing, attached props placement, bone simplification switch, and COM3D2 pose retargeting.
+- test-char-pose: **v1.5.3** - Full COM3D2 material and shader alignment, vectorized CIELAB ColorMask texture baking, scene deduplication, and character pose retargeting.
 
 ### Version History
+- **v1.5.3**:
+  - Implemented full COM3D2 material standard compliance for CM3D2 Converter in Blender 4.2 (`_MainTex`, `_ShadowTex`, `_ToonRamp`, `_ShadowRateToon`, `_Color`, `_ShadowColor`, `_RimColor`, `_OutlineColor`, `_Shininess`, `_OutlineWidth`, `_RimPower`, `_RimShift`).
+  - Added automatic hook into CM3D2 Converter's `COM3D2 Shader` and `Toon Vector` node trees for viewport toon shading and 100% compliant `.model` export.
+  - Implemented vectorized CIELAB ($L^*, a^*, b^*$) ColorMask texture baking using NumPy, preserving base texture luminance, highlights, and shadow folds without color muddiness.
+  - Added scene-wide prop texture pre-scan and deduplication: hundreds of identical objects share single baked textures and materials (e.g. 1,594 objects map cleanly to just 40 unique materials).
 - **v1.5.2**:
   - Added "Simplify Bone Hierarchy" UI toggle (default: ON) to exclude KK internal physics collision capsules (`k_f_*`), hitboxes (`cf_hit_*`), IK widget bones (`cf_pv_*`), and unused facial expression morph bones (`cf_J_Eye*`, `cf_J_Cheek*`, etc.).
   - Preserves 100% of essential COM body retargeting bones and all 54 accessory attachment points (`a_n_*`) with fully intact parent chains up to root.

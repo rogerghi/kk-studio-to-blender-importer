@@ -519,6 +519,16 @@ class KK_OT_ImportScene(bpy.types.Operator):
             item_keys = [k for k, n in parser.parsed_tree.items() if n["kind"] == 1]
             total_items = len(item_keys)
 
+            unique_prop_configs = set()
+            for k in item_keys:
+                node = parser.parsed_tree[k]
+                uar = parser.uar_items.get(k)
+                mod_id = uar.get("ModID") if uar else None
+                slot = uar.get("Slot") if uar else None
+                c_tuple = tuple(node.get("colors", []))
+                unique_prop_configs.add((node.get("group", 0), node.get("category", 0), node.get("no", 0), mod_id, slot, c_tuple))
+            print(f"[KK Importer] Pre-scan: {total_items} scene props map to {len(unique_prop_configs)} unique prefab/color definitions.")
+
             for item_idx, dic_key in enumerate(item_keys):
                 if not props.import_attached_props and dic_key in char_attachments:
                     continue

@@ -2,6 +2,7 @@ import os
 import json
 import glob
 import zipfile
+import numpy as np
 import bpy
 from mathutils import Matrix, Vector, Quaternion
 
@@ -17,6 +18,157 @@ try:
 except ImportError as e:
     print(f"[KK Studio Importer ERROR] Failed to import UnityPy/PIL in mesh_loader: {e}")
 
+
+def rgb_to_lab(rgb_arr):
+    """Vectorized sRGB [0..1] to CIELAB (L*, a*, b*)."""
+    mask = rgb_arr > 0.04045
+    rgb_lin = np.where(mask, np.power((rgb_arr + 0.055) / 1.055, 2.4), rgb_arr / 12.92)
+    M = np.array([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ], dtype=np.float32)
+    xyz = np.dot(rgb_lin, M.T)
+    xyz[..., 0] /= 0.95047
+    xyz[..., 1] /= 1.00000
+    xyz[..., 2] /= 1.08883
+    delta = 6.0 / 29.0
+    f_xyz = np.where(xyz > (delta ** 3), np.cbrt(xyz), (xyz / (3 * delta ** 2)) + (4.0 / 29.0))
+    L = 116.0 * f_xyz[..., 1] - 16.0
+    a = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
+    b = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])
+    return np.stack([L, a, b], axis=-1)
+
+
+def lab_to_rgb(lab_arr):
+    """Vectorized CIELAB to sRGB [0..1]."""
+    L = lab_arr[..., 0]
+    a = lab_arr[..., 1]
+    b = lab_arr[..., 2]
+    fY = (L + 16.0) / 116.0
+    fX = fY + (a / 500.0)
+    fZ = fY - (b / 200.0)
+    delta = 6.0 / 29.0
+    def inv_f(f_val):
+        return np.where(f_val > delta, np.power(f_val, 3), 3 * (delta ** 2) * (f_val - 4.0 / 29.0))
+    X = inv_f(fX) * 0.95047
+    Y = inv_f(fY) * 1.00000
+    Z = inv_f(fZ) * 1.08883
+    xyz = np.stack([X, Y, Z], axis=-1)
+    M_inv = np.array([
+        [ 3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660,  1.8760108,  0.0415560],
+        [ 0.0556434, -0.2040259,  1.0572252]
+    ], dtype=np.float32)
+    rgb_lin = np.dot(xyz, M_inv.T)
+    rgb = np.where(rgb_lin > 0.0031308, 1.055 * np.power(np.maximum(rgb_lin, 0.0), 1.0 / 2.4) - 0.055, 12.92 * rgb_lin)
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def apply_cielab_colormask(base_img_pil, mask_img_pil, colors):
+    """
+    Applies 3-channel ColorMask tinting in CIELAB space to preserve texture shading and contrast.
+    colors: list of [r, g, b] floats (0.0 to 1.0) for [R-mask, G-mask, B-mask].
+    """
+    base_arr = np.array(base_img_pil.convert("RGBA"), dtype=np.float32)
+    rgb = base_arr[..., :3] / 255.0
+    alpha = base_arr[..., 3:4]
+
+    c_arr = np.array(colors, dtype=np.float32)
+    target_labs = rgb_to_lab(c_arr.reshape(1, 3, 3))[0]
+
+    if mask_img_pil:
+        mask_resized = mask_img_pil.convert("RGBA").resize(base_img_pil.size, Image.Resampling.BILINEAR)
+        mask_arr = np.array(mask_resized, dtype=np.float32) / 255.0
+        w_r = mask_arr[..., 0]
+        w_g = mask_arr[..., 1]
+        w_b = mask_arr[..., 2]
+    else:
+        w_r = np.ones((base_img_pil.size[1], base_img_pil.size[0]), dtype=np.float32)
+        w_g = np.zeros_like(w_r)
+        w_b = np.zeros_like(w_r)
+
+    w_total = w_r + w_g + w_b
+    w_sum = np.clip(w_total, 0.0, 1.0)[..., np.newaxis]
+
+    base_lab = rgb_to_lab(rgb)
+    L_base = base_lab[..., 0:1]
+    a_base = base_lab[..., 1:2]
+    b_base = base_lab[..., 2:3]
+
+    safe_w = np.maximum(w_total[..., np.newaxis], 1e-5)
+    target_a = (w_r[..., np.newaxis] * target_labs[0, 1] +
+                w_g[..., np.newaxis] * target_labs[1, 1] +
+                w_b[..., np.newaxis] * target_labs[2, 1]) / safe_w
+    target_b = (w_r[..., np.newaxis] * target_labs[0, 2] +
+                w_g[..., np.newaxis] * target_labs[1, 2] +
+                w_b[..., np.newaxis] * target_labs[2, 2]) / safe_w
+    target_L = (w_r[..., np.newaxis] * target_labs[0, 0] +
+                w_g[..., np.newaxis] * target_labs[1, 0] +
+                w_b[..., np.newaxis] * target_labs[2, 0]) / safe_w
+
+    L_mod = np.clip(L_base * (target_L / 100.0), 0.0, 100.0)
+
+    final_L = (1.0 - w_sum) * L_base + w_sum * L_mod
+    final_a = (1.0 - w_sum) * a_base + w_sum * target_a
+    final_b = (1.0 - w_sum) * b_base + w_sum * target_b
+
+    final_lab = np.concatenate([final_L, final_a, final_b], axis=-1)
+    final_rgb = lab_to_rgb(final_lab)
+
+    out_arr = np.concatenate([final_rgb * 255.0, alpha], axis=-1).astype(np.uint8)
+    return Image.fromarray(out_arr, mode="RGBA")
+
+
+def get_cm3d2_toon_textures():
+    toon_gray_path = None
+    shadow_rate_path = None
+    try:
+        datafiles_dir = bpy.utils.user_resource('DATAFILES')
+        candidate_dir = os.path.join(datafiles_dir, 'CM3D2 Converter', 'toon')
+        if os.path.isdir(candidate_dir):
+            p1 = os.path.join(candidate_dir, 'toongraya1.png')
+            p2 = os.path.join(candidate_dir, 'toondress_shadow.png')
+            if os.path.isfile(p1): toon_gray_path = p1
+            if os.path.isfile(p2): shadow_rate_path = p2
+    except Exception:
+        pass
+    return toon_gray_path, shadow_rate_path
+
+
+def get_cm3d2_converter_module():
+    try:
+        import cm3d2_converter
+        return cm3d2_converter
+    except ImportError:
+        pass
+
+    try:
+        ext_dir = bpy.utils.user_resource('EXTENSIONS')
+        if ext_dir and os.path.exists(ext_dir):
+            for root, dirs, _ in os.walk(ext_dir):
+                if 'cm3d2_converter' in dirs:
+                    if root not in sys.path:
+                        sys.path.insert(0, root)
+                    import cm3d2_converter
+                    return cm3d2_converter
+    except Exception:
+        pass
+
+    try:
+        addons_dir = bpy.utils.user_resource('SCRIPTS', path="addons")
+        candidate = os.path.join(addons_dir, "CM3D2 Converter")
+        if os.path.isdir(candidate):
+            if addons_dir not in sys.path:
+                sys.path.insert(0, addons_dir)
+            import cm3d2_converter
+            return cm3d2_converter
+    except Exception:
+        pass
+
+    return None
+
+
 class KKMeshLoader:
     def __init__(self, kk_dir: str, use_fallback_cubes: bool = False):
         self.kk_dir = kk_dir
@@ -29,6 +181,21 @@ class KKMeshLoader:
         addon_dir = os.path.dirname(os.path.abspath(__file__))
         self.tex_cache_dir = os.path.join(addon_dir, "cache", "textures")
         os.makedirs(self.tex_cache_dir, exist_ok=True)
+
+        self.cm3d2_converter = get_cm3d2_converter_module()
+        self.toon_gray_img = None
+        self.shadow_rate_img = None
+        toon_p, shadow_p = get_cm3d2_toon_textures()
+        if toon_p and os.path.exists(toon_p):
+            try:
+                self.toon_gray_img = bpy.data.images.load(toon_p, check_existing=True)
+            except Exception:
+                pass
+        if shadow_p and os.path.exists(shadow_p):
+            try:
+                self.shadow_rate_img = bpy.data.images.load(shadow_p, check_existing=True)
+            except Exception:
+                pass
 
     def _get_shared_env(self):
         """Loads shared studio/mat bundles so cross-bundle materials and textures resolve properly."""
@@ -318,7 +485,7 @@ class KKMeshLoader:
         return mesh_data
 
     def _create_blender_material(self, item_name: str, tex_map: dict, colors: list, unity_mat=None):
-        """Creates a COM3D2-ready Principled BSDF material with accurate ColorMask tinting."""
+        """Creates a COM3D2-standard material with CIELAB ColorMask tinting and CM3D2 Converter nodes."""
         c1 = [1.0, 1.0, 1.0]
         c2 = [1.0, 1.0, 1.0]
         c3 = [1.0, 1.0, 1.0]
@@ -326,35 +493,27 @@ class KKMeshLoader:
             for idx, c_arr in enumerate([c1, c2, c3]):
                 if idx < len(colors) and colors[idx]:
                     try:
-                        c_json = json.loads(colors[idx])
+                        c_json = json.loads(colors[idx]) if isinstance(colors[idx], str) else colors[idx]
                         c_arr[0] = float(c_json.get("r", 1.0))
                         c_arr[1] = float(c_json.get("g", 1.0))
                         c_arr[2] = float(c_json.get("b", 1.0))
                     except Exception:
                         pass
 
+        is_tinted = any(abs(x - 1.0) > 0.01 for x in c1 + c2 + c3)
+        if is_tinted:
+            c1_hex = f"{int(c1[0]*255):02X}{int(c1[1]*255):02X}{int(c1[2]*255):02X}"
+            c2_hex = f"{int(c2[0]*255):02X}{int(c2[1]*255):02X}{int(c2[2]*255):02X}"
+            c3_hex = f"{int(c3[0]*255):02X}{int(c3[1]*255):02X}{int(c3[2]*255):02X}"
+            tex_hash = f"{c1_hex}_{c2_hex}_{c3_hex}"
+        else:
+            tex_hash = "orig"
+
         mat_prefix = getattr(unity_mat, "m_Name", item_name) if unity_mat else item_name
-        color_hash = f"{c1[0]:.2f}_{c1[1]:.2f}_{c1[2]:.2f}_{c2[0]:.2f}_{c2[1]:.2f}_{c2[2]:.2f}"
-        mat_name = f"M_{mat_prefix}_{color_hash}"
+        mat_name = f"M_{mat_prefix}_{tex_hash}"
 
         if mat_name in self.mat_cache:
             return self.mat_cache[mat_name]
-
-        mat = bpy.data.materials.new(name=mat_name)
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
-        nodes.clear()
-
-        # Set custom properties for CM3D2 Converter export
-        mat["shader1"] = "CM3D2/Toony_Lighted"
-        mat["shader2"] = "CM3D2__Toony_Lighted"
-
-        output_node = nodes.new(type="ShaderNodeOutputMaterial")
-        output_node.location = (300, 0)
-        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
-        bsdf.location = (0, 0)
-        links.new(bsdf.outputs["BSDF"], output_node.inputs["Surface"])
 
         base_tex = None
         color_mask_tex = None
@@ -387,67 +546,124 @@ class KKMeshLoader:
                         break
 
         b_img = None
+        is_transparent = False
         if base_tex:
             try:
-                img_pil = base_tex.image.convert("RGBA")
-                is_tinted = any(abs(x - 1.0) > 0.01 for x in c1 + c2 + c3)
+                base_name = getattr(base_tex, "m_Name", mat_prefix)
+                img_filename = f"T_{base_name}_{tex_hash}.png"
+                img_path = os.path.join(self.tex_cache_dir, img_filename)
 
-                if is_tinted and color_mask_tex:
-                    mask_pil = color_mask_tex.image.convert("RGBA").resize(img_pil.size, Image.NEAREST)
-                    main_data = img_pil.load()
-                    mask_data = mask_pil.load()
-                    w, h = img_pil.size
-                    for y in range(h):
-                        for x in range(w):
-                            mr, mg, mb, _ = mask_data[x, y]
-                            pr, pg, pb, pa = main_data[x, y]
-                            r_w = mr / 255.0
-                            g_w = mg / 255.0
-                            b_w = mb / 255.0
-                            base_w = max(0.0, 1.0 - (r_w + g_w + b_w))
-
-                            tf_r = base_w + r_w * c1[0] + g_w * c2[0] + b_w * c3[0]
-                            tf_g = base_w + r_w * c1[1] + g_w * c2[1] + b_w * c3[1]
-                            tf_b = base_w + r_w * c1[2] + g_w * c2[2] + b_w * c3[2]
-
-                            nr = int(min(255, max(0, pr * tf_r)))
-                            ng = int(min(255, max(0, pg * tf_g)))
-                            nb = int(min(255, max(0, pb * tf_b)))
-                            main_data[x, y] = (nr, ng, nb, pa)
-
-                    img_filename = f"{mat_name}.png"
-                    img_path = os.path.join(self.tex_cache_dir, img_filename)
-                    img_pil.save(img_path)
-                elif is_tinted:
-                    r, g, b, a = img_pil.split()
-                    r = r.point(lambda i: int(min(255, i * c1[0])))
-                    g = g.point(lambda i: int(min(255, i * c1[1])))
-                    b = b.point(lambda i: int(min(255, i * c1[2])))
-                    tinted_pil = Image.merge("RGBA", (r, g, b, a))
-                    img_filename = f"{mat_name}.png"
-                    img_path = os.path.join(self.tex_cache_dir, img_filename)
-                    tinted_pil.save(img_path)
+                if os.path.exists(img_path):
+                    try:
+                        with Image.open(img_path) as chk_img:
+                            if chk_img.mode == "RGBA":
+                                extrema = chk_img.getextrema()
+                                if extrema and len(extrema) >= 4 and extrema[3][0] < 250:
+                                    is_transparent = True
+                    except Exception:
+                        pass
                 else:
-                    img_filename = f"T_{base_tex.m_Name}.png"
-                    img_path = os.path.join(self.tex_cache_dir, img_filename)
-                    if not os.path.exists(img_path):
+                    img_pil = base_tex.image.convert("RGBA")
+                    if is_tinted:
+                        mask_pil = color_mask_tex.image.convert("RGBA") if color_mask_tex else None
+                        tinted_pil = apply_cielab_colormask(img_pil, mask_pil, [c1, c2, c3])
+                        tinted_pil.save(img_path)
+                        chk_arr = np.array(tinted_pil)
+                        if bool(np.any(chk_arr[..., 3] < 250)):
+                            is_transparent = True
+                    else:
                         img_pil.save(img_path)
+                        chk_arr = np.array(img_pil)
+                        if bool(np.any(chk_arr[..., 3] < 250)):
+                            is_transparent = True
 
                 b_img = bpy.data.images.load(img_path, check_existing=True)
             except Exception as e:
                 print(f"[KK Importer] Texture process error for {mat_name}: {e}")
 
-        tex_node = nodes.new(type="ShaderNodeTexImage")
-        tex_node.name = "_MainTex"
-        tex_node.label = "_MainTex"
-        tex_node.location = (-350, 0)
-        if b_img:
-            tex_node.image = b_img
-            links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
-            if "Alpha" in bsdf.inputs and "Alpha" in tex_node.outputs:
-                links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+        # Determine COM shader
+        if is_transparent:
+            shader1 = "CM3D2/Toony_Lighted_Trans"
+            shader2 = "CM3D2__Toony_Lighted_Trans"
         else:
-            bsdf.inputs["Base Color"].default_value = (c1[0], c1[1], c1[2], 1.0)
+            shader1 = "CM3D2/Toony_Lighted"
+            shader2 = "CM3D2__Toony_Lighted"
+
+        mat = bpy.data.materials.new(name=mat_name)
+        mat.use_nodes = True
+        mat["shader1"] = shader1
+        mat["shader2"] = shader2
+        mat["CM3D2 Texture Expand"] = True
+        mat["COM3D2 Shader Rev"] = 1
+
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        def add_tex_node(name, img=None, loc=(-800, 0)):
+            n = nodes.new("ShaderNodeTexImage")
+            n.name = name
+            n.label = name
+            n.location = loc
+            if img: n.image = img
+            return n
+
+        def add_col_node(name, color, loc=(-550, 0)):
+            n = nodes.new("ShaderNodeRGB")
+            n.name = name
+            n.label = name
+            n.location = loc
+            n.outputs[0].default_value = color
+            return n
+
+        def add_val_node(name, val, loc=(-350, 0)):
+            n = nodes.new("ShaderNodeValue")
+            n.name = name
+            n.label = name
+            n.location = loc
+            n.outputs[0].default_value = val
+            return n
+
+        main_tex_node = add_tex_node("_MainTex", b_img, loc=(-800, 300))
+        add_tex_node("_ShadowTex", b_img, loc=(-800, 0))
+
+        if self.toon_gray_img:
+            add_tex_node("_ToonRamp", self.toon_gray_img, loc=(-800, -300))
+        if self.shadow_rate_img:
+            add_tex_node("_ShadowRateToon", self.shadow_rate_img, loc=(-800, -600))
+
+        add_col_node("_Color", (1.0, 1.0, 1.0, 1.0), loc=(-550, 400))
+        add_col_node("_ShadowColor", (0.7, 0.7, 0.7, 1.0), loc=(-550, 200))
+        add_col_node("_RimColor", (0.0, 0.0, 0.0, 0.0), loc=(-550, 0))
+        add_col_node("_OutlineColor", (0.16, 0.16, 0.16, 1.0), loc=(-550, -200))
+
+        add_val_node("_Shininess", 0.0, loc=(-350, 400))
+        add_val_node("_OutlineWidth", 0.002, loc=(-350, 200))
+        add_val_node("_RimPower", 25.0, loc=(-350, 0))
+        add_val_node("_RimShift", 0.0, loc=(-350, -200))
+        add_val_node("_HiRate", 0.0, loc=(-350, -400))
+        add_val_node("_HiPow", 0.0, loc=(-350, -600))
+
+        decorated = False
+        if self.cm3d2_converter:
+            try:
+                self.cm3d2_converter.common.decorate_material(mat, True)
+                decorated = True
+            except Exception:
+                pass
+
+        if not decorated:
+            out_node = nodes.new("ShaderNodeOutputMaterial")
+            out_node.location = (300, 0)
+            bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+            bsdf.location = (0, 0)
+            links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+            if b_img:
+                links.new(main_tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+                if is_transparent and "Alpha" in main_tex_node.outputs:
+                    links.new(main_tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+            else:
+                bsdf.inputs["Base Color"].default_value = (c1[0], c1[1], c1[2], 1.0)
 
         self.mat_cache[mat_name] = mat
         return mat
