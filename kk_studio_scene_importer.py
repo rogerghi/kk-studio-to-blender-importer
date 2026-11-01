@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 5, 5),
+    "version": (1, 5, 6),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
     "description": "Imports Koikatsu Studio scene cards into Blender with character pose armatures, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
@@ -651,6 +651,17 @@ class KK_OT_ImportScene(bpy.types.Operator):
                         if pn and pn in arm_data.edit_bones:
                             arm_data.edit_bones[bn].parent = arm_data.edit_bones[pn]
 
+                    for bn in bnames:
+                        eb = arm_data.edit_bones[bn]
+                        if len(eb.children) == 1:
+                            c = eb.children[0]
+                            if (c.head - eb.head).length > 0.001:
+                                eb.tail = c.head
+                        elif len(eb.children) == 0 and eb.parent:
+                            dir_vec = eb.head - eb.parent.head
+                            if dir_vec.length > 0.001:
+                                eb.tail = eb.head + dir_vec
+
                     bpy.ops.object.mode_set(mode='OBJECT')
 
                     if target_col != scene_col:
@@ -676,6 +687,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     mesh_obj.parent = arm_obj
                     mod = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
                     mod.object = arm_obj
+                    mod.show_in_editmode = True
 
                     def get_eval_order(names, parent_map):
                         vis, order = set(), []
