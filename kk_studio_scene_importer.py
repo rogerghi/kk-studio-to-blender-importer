@@ -224,6 +224,15 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     cur = parser.parsed_tree.get(cur, {}).get("parent_key")
                 return scene_col
 
+            def is_node_effectively_visible(n_key):
+                cur = n_key
+                while cur is not None and cur in parser.parsed_tree:
+                    n = parser.parsed_tree[cur]
+                    if not n.get("visible", True):
+                        return False
+                    cur = n.get("parent_key")
+                return True
+
             def get_eval_order(tree):
                 visited = set()
                 order = []
@@ -509,7 +518,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                         target_col.objects.link(empty)
                         created_objects[dic_key] = empty
 
-                    is_vis = node.get("visible", True)
+                    is_vis = is_node_effectively_visible(dic_key)
                     # Don't hide character armatures if user requested character poses
                     if not is_vis and kind != 0:
                         created_objects[dic_key].hide_viewport = True
@@ -580,7 +589,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                         continue
 
                 target_col = get_target_collection(dic_key)
-                is_vis = node.get("visible", True)
+                is_vis = is_node_effectively_visible(dic_key)
 
                 def setup_skinned_part(part, part_display_name, target_col, is_vis, node_bones):
                     arm_info = part["armature_data"]
@@ -816,8 +825,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
 
             root_lc = context.view_layer.layer_collection
             for f_key, f_col in folder_cols.items():
-                f_node = parser.parsed_tree[f_key]
-                if not f_node.get("visible", True):
+                if not is_node_effectively_visible(f_key):
                     f_col.hide_viewport = True
                     f_col.hide_render = True
                     set_collection_visibility(root_lc, f_col, False)
