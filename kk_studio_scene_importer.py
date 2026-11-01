@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 5, 4),
+    "version": (1, 5, 5),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
     "description": "Imports Koikatsu Studio scene cards into Blender with character pose armatures, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
@@ -316,21 +316,25 @@ class KK_OT_ImportScene(bpy.types.Operator):
                 scale = node["scale"]
                 pk = node.get("parent_key")
 
-                # Direct character bone attachment
+                # Direct character attachment (bone or character root)
                 if pk is not None and pk in parser.parsed_tree and parser.parsed_tree[pk].get("kind") == 0:
                     ap_idx = node.get("attach_point")
                     ap_name = acc_map.get(ap_idx) if acc_map else None
+                    t_u = Vector(pos)
+                    r_u = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_matrix().to_4x4()
+                    s_u = Matrix.Diagonal(Vector((scale[0], scale[1], scale[2], 1.0)))
+                    m_local_u = Matrix.Translation(t_u) @ r_u @ s_u
+
                     if ap_name and pk in char_posed_u and ap_name in char_posed_u[pk]:
                         m_bone_u = char_posed_u[pk][ap_name]
-                        t_u = Vector(pos)
-                        r_u = Euler((math.radians(rot[0]), math.radians(rot[1]), math.radians(rot[2])), 'ZXY').to_matrix().to_4x4()
-                        s_u = Matrix.Diagonal(Vector((scale[0], scale[1], scale[2], 1.0)))
-                        m_local_u = Matrix.Translation(t_u) @ r_u @ s_u
                         m_in_char_u = m_bone_u @ m_local_u
                         char_attachments[k] = (pk, ap_name, m_in_char_u)
-                        continue
+                    else:
+                        # Attached to character root GameObject
+                        char_attachments[k] = (pk, None, m_local_u)
+                    continue
 
-                # Indirect character attachment (descendant of an attached prop)
+                # Indirect character attachment (descendant of an attached prop/folder)
                 if pk is not None and pk in char_attachments:
                     char_key, _, parent_m_in_char_u = char_attachments[pk]
                     t_u = Vector(pos)
@@ -540,6 +544,25 @@ class KK_OT_ImportScene(bpy.types.Operator):
                 unique_prop_configs.add((node.get("group", 0), node.get("category", 0), node.get("no", 0), mod_id, slot, c_tuple))
             print(f"[KK Importer] Pre-scan: {total_items} scene props map to {len(unique_prop_configs)} unique prefab/color definitions.")
 
+            def is_effect_item(n, it_def):
+                g = n.get("group")
+                c = n.get("category")
+                if g == 10: # Studio Effect
+                    return True
+                if g == 14 and c == 77: # Glow / Light items
+                    return True
+                if g == 9 and c == 5: # Silhouette / Vignette planes
+                    return True
+                if g == 1 and c == 38: # Screen / Backdrop planes
+                    return True
+                if it_def:
+                    pref = it_def.get("prefab", "").lower()
+                    if any(w in pref for w in ["marukage", "particle", "glow0", "glow1"]):
+                        return True
+                    if it_def.get("source") == "zipmod" and "effect" in str(it_def.get("zipmod", "")).lower():
+                        return True
+                return False
+
             for item_idx, dic_key in enumerate(item_keys):
                 if not props.import_attached_props and dic_key in char_attachments:
                     continue
@@ -556,6 +579,9 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     node.get("group", 0), node.get("category", 0), node.get("no", 0),
                     uar_guid, uar_slot, custom_name
                 )
+
+                if not props.import_effects and is_effect_item(node, item_def):
+                    continue
 
                 # Determine actual object name prioritizing KK Prefab name, keeping _[dic_key]
                 if item_def and item_def.get("prefab"):
@@ -610,17 +636,15 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     bposes = arm_info["bind_poses"]
                     pmap = arm_info["parent_map"]
 
-                    head_positions = {}
-                    for bn, bp in zip(bnames, bposes):
-                        mat = Matrix(bp)
-                        inv = mat.inverted()
-                        head_positions[bn] = Vector((-inv.translation.x, inv.translation.y, inv.translation.z))
+                    M_rest_u = {bn: Matrix(bp).inverted() for bn, bp in zip(bnames, bposes)}
+                    E_rest_bl = {bn: C_flip @ M_rest_u[bn] @ C_flip for bn in bnames}
 
                     for bn in bnames:
                         eb = arm_data.edit_bones.new(bn)
-                        h = head_positions[bn]
-                        eb.head = h
-                        eb.tail = h + Vector((0, 0, 0.02))
+                        E = E_rest_bl[bn]
+                        eb.head = E.translation
+                        eb.tail = E.translation + E.to_3x3() @ Vector((0, 0.02, 0))
+                        eb.matrix = E
 
                     for bn in bnames:
                         pn = pmap.get(bn)
@@ -653,17 +677,77 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     mod = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
                     mod.object = arm_obj
 
-                    for bn, bd in node_bones.items():
-                        pb = arm_obj.pose.bones.get(bn)
-                        if pb:
-                            rot = bd["rot"]
+                    def get_eval_order(names, parent_map):
+                        vis, order = set(), []
+                        def visit(b):
+                            if b in vis: return
+                            vis.add(b)
+                            p = parent_map.get(b)
+                            if p and p in parent_map:
+                                visit(p)
+                            order.append(b)
+                        for b in names: visit(b)
+                        return order
+
+                    eval_order = get_eval_order(bnames, pmap)
+                    M_posed_u = {}
+                    for bn in eval_order:
+                        parent = pmap.get(bn)
+                        rest_u = M_rest_u[bn]
+                        if parent and parent in M_rest_u:
+                            rest_local_u = M_rest_u[parent].inverted() @ rest_u
+                        else:
+                            rest_local_u = rest_u
+
+                        bd = node_bones.get(bn)
+                        if bd:
+                            rot = bd.get("rot", (0, 0, 0))
                             rx = math.radians(rot[0])
-                            ry = math.radians(-rot[1])
-                            rz = math.radians(-rot[2])
-                            pb.rotation_mode = 'QUATERNION'
-                            pb.rotation_quaternion = Euler((rx, ry, rz), 'ZXY').to_quaternion()
-                            if any(abs(x) > 0.0001 for x in bd["pos"]):
-                                pb.location = Vector((-bd["pos"][0], bd["pos"][1], bd["pos"][2]))
+                            ry = math.radians(rot[1])
+                            rz = math.radians(rot[2])
+                            r_mat = Euler((rx, ry, rz), 'ZXY').to_matrix().to_4x4()
+
+                            pos = bd.get("pos", (0, 0, 0))
+                            if any(abs(x) > 0.0001 for x in pos):
+                                t_mat = Matrix.Translation(Vector(pos))
+                            else:
+                                t_mat = Matrix.Translation(rest_local_u.translation)
+
+                            s_arr = bd.get("scale", (1, 1, 1))
+                            s_mat = Matrix.Diagonal(Vector((s_arr[0], s_arr[1], s_arr[2], 1.0)))
+
+                            m_local_u = t_mat @ r_mat @ s_mat
+                        else:
+                            m_local_u = rest_local_u
+
+                        if parent and parent in M_posed_u:
+                            M_posed_u[bn] = M_posed_u[parent] @ m_local_u
+                        else:
+                            M_posed_u[bn] = m_local_u
+
+                    P_posed_bl = {bn: C_flip @ M_posed_u[bn] @ C_flip for bn in bnames}
+
+                    pose_bones = arm_obj.pose.bones
+                    for bn in eval_order:
+                        pb = pose_bones.get(bn)
+                        if not pb:
+                            continue
+                        pn = pmap.get(bn)
+                        E_b = E_rest_bl[bn]
+                        P_b = P_posed_bl[bn]
+
+                        if pn and pn in E_rest_bl and pn in P_posed_bl:
+                            E_p = E_rest_bl[pn]
+                            P_p = P_posed_bl[pn]
+                            M_basis = E_b.inverted() @ E_p @ P_p.inverted() @ P_b
+                        else:
+                            M_basis = E_b.inverted() @ P_b
+
+                        pb.rotation_mode = 'QUATERNION'
+                        loc, rot, sca = M_basis.decompose()
+                        pb.location = loc
+                        pb.rotation_quaternion = rot
+                        pb.scale = sca
 
                     if not is_vis:
                         arm_obj.hide_viewport = True
@@ -880,6 +964,11 @@ class KKStudioSceneProperties(bpy.types.PropertyGroup):
         description="Load props attached to characters (body/clothes ignored)",
         default=True
     )
+    import_effects: BoolProperty(
+        name="Import Studio Effects",
+        description="Load 2D/3D studio lighting effects, screen planes, particles, and backdrop frames",
+        default=False
+    )
     import_meshless: BoolProperty(
         name="Import Meshless Objects",
         description="Load objects without 3D geometry (keeps hierarchy empties for children if disabled, skips leaf meshless objects)",
@@ -925,6 +1014,7 @@ class KK_PT_StudioImporterPanel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Scene Props:", icon='PREFERENCES')
         box.prop(props, "import_attached_props")
+        box.prop(props, "import_effects")
         box.prop(props, "import_meshless")
         box.prop(props, "use_fallback_cubes")
 

@@ -161,6 +161,7 @@ class KKItemResolver:
                                         if guid:
                                              self.zipmod_items[(guid, slot)] = info
                                         self.name_index[prefab_name.lower()] = info
+                                        self.item_index[f"{cat}_{subcat}_{slot}"] = info
                                     except ValueError:
                                         continue
             except Exception:
