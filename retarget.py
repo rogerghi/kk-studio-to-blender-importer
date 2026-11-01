@@ -299,7 +299,26 @@ def load_base_skeleton_data():
         return None, None, None
 
 
-def build_char_skeleton(base_skeleton, char_node=None):
+def get_essential_skeleton_bones(sk_dict, acc_map=None):
+    """Compute the minimal set of essential bones required for COM retargeting and prop attachment."""
+    targets = set(COM_TO_KK_BONES.values()) | set(KK_TO_COM_BONES.keys())
+    if acc_map:
+        targets.update(acc_map.values())
+    else:
+        _, acc_m, _ = load_base_skeleton_data()
+        if acc_m:
+            targets.update(acc_m.values())
+
+    essential = set()
+    for b in targets:
+        curr = b
+        while curr:
+            essential.add(curr)
+            curr = sk_dict.get(curr, {}).get("p")
+    return essential
+
+
+def build_char_skeleton(base_skeleton, char_node=None, simplify=True, acc_map=None):
     """Build a per-character skeleton with Koikatsu ShapeBodyInfoFemale sliders and KKABMX bone modifiers applied."""
     if not base_skeleton:
         return {}
@@ -381,6 +400,10 @@ def build_char_skeleton(base_skeleton, char_node=None):
         info["t"] = [info["t"][0] * ln + po[0], info["t"][1] * ln + po[1], info["t"][2] * ln + po[2]]
         if any(abs(x) > 1e-5 for x in ro):
             info["abm_rot"] = list(ro)
+
+    if simplify:
+        essential = get_essential_skeleton_bones(sk, acc_map)
+        sk = {k: v for k, v in sk.items() if k in essential}
 
     return sk
 

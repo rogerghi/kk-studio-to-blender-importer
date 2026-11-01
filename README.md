@@ -4,9 +4,13 @@ Blender 3.0+ add-on to import Koikatsu Studio scene cards (.png) directly into B
 
 ## Branches
 - main: **v1.4.1** - Stable version. Imports scene props and environment cleanly without characters.
-- test-char-pose: **v1.5.1** - Character armature generation with embedded body slider and KKABMX bone modifier resizing, attached props placement, and COM3D2 pose retargeting.
+- test-char-pose: **v1.5.2** - Character armature generation with embedded body slider and KKABMX bone modifier resizing, attached props placement, bone simplification switch, and COM3D2 pose retargeting.
 
 ### Version History
+- **v1.5.2**:
+  - Added "Simplify Bone Hierarchy" UI toggle (default: ON) to exclude KK internal physics collision capsules (`k_f_*`), hitboxes (`cf_hit_*`), IK widget bones (`cf_pv_*`), and unused facial expression morph bones (`cf_J_Eye*`, `cf_J_Cheek*`, etc.).
+  - Preserves 100% of essential COM body retargeting bones and all 54 accessory attachment points (`a_n_*`) with fully intact parent chains up to root.
+  - Reduces KK armature clutter from 435 bones down to 167 clean bones while preserving exact 0.000000m world transforms for all attached accessories and props.
 - **v1.5.1**:
   - Resized imported KK character armatures to match scene height and bone lengths by parsing embedded character cards (`shapeValueBody` sliders from `Custom` and `KKABMX` bone modifiers from `KKEx`).
   - Fixed KK-to-COM3D2 bone pairing (`Bip01 Pelvis` to `cf_j_waist02`, spine chains, twist/helper bones) and canonical T-pose offset math so COM3D2 body rig mirrors the scene pose without resizing COM bones.

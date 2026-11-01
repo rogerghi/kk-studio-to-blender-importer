@@ -251,7 +251,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
             if skeleton:
                 for dic_key, node in parser.parsed_tree.items():
                     if node.get("kind") == 0:
-                        char_sk = build_char_skeleton(skeleton, node)
+                        char_sk = build_char_skeleton(skeleton, node, simplify=props.simplify_armature_bones, acc_map=acc_map)
                         char_skeletons[dic_key] = char_sk
                         char_bones = node.get("bones", {})
                         r_hand_active = (
@@ -365,7 +365,7 @@ class KK_OT_ImportScene(bpy.types.Operator):
                     target_col = folder_cols.get(dic_key) if kind == 3 else get_target_collection(dic_key)
 
                     if kind == 0 and skeleton and props.import_character_pose:
-                        char_sk = char_skeletons.get(dic_key) or build_char_skeleton(skeleton, node)
+                        char_sk = char_skeletons.get(dic_key) or build_char_skeleton(skeleton, node, simplify=props.simplify_armature_bones, acc_map=acc_map)
                         arm_data = bpy.data.armatures.new(f"{display_name}_Armature")
                         arm_data.display_type = 'OCTAHEDRAL'
                         arm_obj = bpy.data.objects.new(display_name, arm_data)
@@ -845,6 +845,11 @@ class KKStudioSceneProperties(bpy.types.PropertyGroup):
         description="Build posed KK character armature from scene FK data",
         default=True
     )
+    simplify_armature_bones: BoolProperty(
+        name="Simplify Bone Hierarchy",
+        description="Exclude internal Koikatsu physics, collision, and morph clutter bones (keeps only COM body & accessory attachment bones)",
+        default=True
+    )
     transfer_to_com_body: BoolProperty(
         name="Transfer to COM Body",
         description="Append lightweight COM body and retarget the pose via driver constraints",
@@ -893,6 +898,7 @@ class KK_PT_StudioImporterPanel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Character & COM Pose:", icon='ARMATURE_DATA')
         box.prop(props, "import_character_pose")
+        box.prop(props, "simplify_armature_bones")
         box.prop(props, "transfer_to_com_body")
         box.operator("kk_studio.transfer_to_com", text="Retarget Active Rig to COM", icon='CON_ROTLIMIT')
 
