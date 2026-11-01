@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 5, 1),
+    "version": (1, 5, 4),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
     "description": "Imports Koikatsu Studio scene cards into Blender with character pose armatures, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
@@ -48,6 +48,7 @@ try:
     from .com_tools import (
         KK_OT_CleanOccludedGeometry,
         KK_OT_MergeSelectedProps,
+        KK_OT_CalculateMeshStats,
     )
 except ImportError:
     from parser import KKStudioParser
@@ -66,6 +67,7 @@ except ImportError:
     from com_tools import (
         KK_OT_CleanOccludedGeometry,
         KK_OT_MergeSelectedProps,
+        KK_OT_CalculateMeshStats,
     )
 
 
@@ -931,6 +933,7 @@ class KK_PT_StudioImporterPanel(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="COM3D2 Merge & Prep (Selected):", icon='MOD_SOLIDIFY')
+        box.operator("kk_studio.calc_mesh_stats", text="Calculate Visible Vertices & Splits", icon='INFO')
         box.operator("kk_studio.clean_occluded_geometry", text="Clean Occluded Geometry", icon='BRUSH_DATA')
         box.operator("kk_studio.merge_selected_props", text="Merge Selected into .model Mesh", icon='AUTOMERGE_ON')
 
@@ -940,6 +943,7 @@ classes = (
     KK_OT_ReindexDatabase,
     KK_OT_TransferToCOM,
     KK_OT_ImportScene,
+    KK_OT_CalculateMeshStats,
     KK_OT_CleanOccludedGeometry,
     KK_OT_MergeSelectedProps,
     KK_PT_StudioImporterPanel,

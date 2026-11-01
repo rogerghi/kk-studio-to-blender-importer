@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Koikatsu Studio Scene Importer",
     "author": "rinasaurus",
-    "version": (1, 5, 3),
+    "version": (1, 5, 4),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar (N) > KK Studio",
     "description": "Imports Koikatsu Studio scene cards into Blender with character pose armatures, preserving exact hierarchy, transforms, multi-part meshes, and tinted textures for COM3D2 export.",
@@ -49,6 +49,7 @@ from .retarget import (
 from .com_tools import (
     KK_OT_CleanOccludedGeometry,
     KK_OT_MergeSelectedProps,
+    KK_OT_CalculateMeshStats,
 )
 from .kk_studio_scene_importer import (
     KKStudioSceneProperties,

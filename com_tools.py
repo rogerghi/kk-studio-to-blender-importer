@@ -1,5 +1,6 @@
 import bpy
 import bmesh
+import math
 from mathutils import Matrix, Vector
 
 class KK_OT_CleanOccludedGeometry(bpy.types.Operator):
@@ -205,4 +206,60 @@ class KK_OT_MergeSelectedProps(bpy.types.Operator):
         else:
             self.report({'INFO'}, f"Successfully created '{self.merged_name}' with {vert_count} vertices and {len(merged_obj.material_slots)} materials!")
 
+        return {'FINISHED'}
+
+
+class KK_OT_CalculateMeshStats(bpy.types.Operator):
+    bl_idname = "kk_studio.calc_mesh_stats"
+    bl_label = "Calculate Visible Vertices & Splits"
+    bl_description = "Calculates total visible and selected vertices and estimates required COM3D2 .model split count (max 65,000 verts per model)"
+    bl_options = {'REGISTER'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        vis_meshes = [o for o in context.view_layer.objects if o.type == 'MESH' and o.visible_get()]
+        sel_meshes = [o for o in context.selected_objects if o.type == 'MESH']
+
+        vis_verts = sum(len(o.data.vertices) for o in vis_meshes)
+        sel_verts = sum(len(o.data.vertices) for o in sel_meshes)
+        vis_splits = max(1, math.ceil(vis_verts / 65000)) if vis_verts > 0 else 0
+        sel_splits = max(1, math.ceil(sel_verts / 65000)) if sel_verts > 0 else 0
+
+        # Visible section
+        box = layout.box()
+        box.label(text="All Viewport Visible Meshes:", icon='RESTRICT_VIEW_OFF')
+        col = box.column(align=True)
+        col.label(text=f"Total Meshes: {len(vis_meshes)}")
+        col.label(text=f"Total Vertices: {vis_verts:,}")
+        if vis_verts > 65000:
+            sub = col.row()
+            sub.alert = True
+            sub.label(text=f"Needs {vis_splits} separate .model files (<=65k limit)", icon='ERROR')
+        else:
+            sub = col.row()
+            sub.label(text="Fits into 1 single .model file (<=65k)", icon='CHECKMARK')
+
+        # Selected section
+        if sel_meshes:
+            box = layout.box()
+            box.label(text="Currently Selected Meshes:", icon='RESTRICT_SELECT_OFF')
+            col = box.column(align=True)
+            col.label(text=f"Selected Meshes: {len(sel_meshes)}")
+            col.label(text=f"Selected Vertices: {sel_verts:,}")
+            if sel_verts > 65000:
+                sub = col.row()
+                sub.alert = True
+                sub.label(text=f"Selected exceeds 65k! ({sel_splits} models needed)", icon='ERROR')
+            else:
+                sub = col.row()
+                sub.label(text="Selected fits into 1 .model file!", icon='CHECKMARK')
+
+    def execute(self, context):
+        vis_meshes = [o for o in context.view_layer.objects if o.type == 'MESH' and o.visible_get()]
+        vis_verts = sum(len(o.data.vertices) for o in vis_meshes)
+        vis_splits = max(1, math.ceil(vis_verts / 65000)) if vis_verts > 0 else 0
+        self.report({'INFO'}, f"Visible: {vis_verts:,} vertices across {len(vis_meshes)} meshes -> {vis_splits} .model file(s) needed")
         return {'FINISHED'}
